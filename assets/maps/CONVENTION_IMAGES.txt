@@ -1,0 +1,13 @@
+BLUEFOX ODYSSEY — CONVENTION DES IMAGES DE MAPS
+
+1nomdelimage.png
+  Image de scène ou panorama du biome.
+  Utilisée pour le décor lointain et le hublot du Journal.
+
+01.png, 02.png, 03.png…
+  Trames de terrain du plateau jouable.
+  Une map peut utiliser une ou plusieurs trames.
+
+Les associations entre scènes, trames et passages sont déclarées dans
+map-assets.js. Les noms physiques pourront être remplacés sans modifier
+le contrôleur 3D.
