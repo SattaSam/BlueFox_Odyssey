@@ -132,8 +132,14 @@
   };
 
   const registeredEntries = new Map();
+  const fallbackTerrainUrls = Object.freeze([
+    "./Images/028_1.png",
+    "./Images/028_2.png",
+    "./Images/028_3.png"
+  ]);
   const api = {
     version: 2,
+    fallbackTerrainUrls,
     filenameRules: {
       scene: scenePattern,
       terrain: terrainPattern,
@@ -167,14 +173,7 @@
         number: 1,
         scene: "1PlaineCristaux",
         terrainFrames: ["01"],
-        exits: { north: "jungle" }
-      },
-      jungle: {
-        id: "jungle",
-        number: 2,
-        scene: "2RuinesEmeraude",
-        terrainFrames: ["02_1", "02_2"],
-        exits: { south: "crystal" }
+        exits: {}
       }
     }
   };

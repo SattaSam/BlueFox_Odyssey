@@ -17,6 +17,9 @@
       this.transitioning = false;
       this.lastSavedAt = 0;
       this.lastAutonomyAt = performance.now();
+      this.autonomyActionStreak = 0;
+      this.autonomyBreakTarget = 2 + Math.floor(Math.random() * 2);
+      this.lastFatigueSpeechAt = -30000;
       this.lastSpeechAt = -10000;
       this.discoveredMaps = new Set(["crystal"]);
       this.discoveredZones = new Set();
@@ -70,6 +73,11 @@
       this.performanceHighSamples = 0;
       this.measuredFps = 60;
       this.missingImageUrls = new Set();
+      this.generatedTopology = [];
+      this.mapNames = new Map();
+      this.navigationRoute = [];
+      this.persistentNavigationIntent = null;
+      this.returningToBase = false;
       this.onMissingImage = (event) => {
         const source = String(event.detail?.source || "image inconnue");
         if (this.missingImageUrls.has(source)) return;
@@ -92,7 +100,10 @@
     async initialize() {
       const { THREE, OrbitControls, GLTFLoader, container } = this;
       global.addEventListener("bluefox:image-missing", this.onMissingImage);
+      BF.MapGenerator?.restore?.();
       this.restoreDiscovery();
+      this.restoreMapNames();
+      this.restoreGeneratedTopology();
       BF.sceneImages = {
         crystal: this.assets.sceneCrystal,
         jungle: this.assets.sceneJungle
@@ -178,10 +189,38 @@
       this.resizeObserver.observe(container);
 
       this.callbacks.onStatus("Nouveau moteur 3D initialisé sur une base stable.");
-      this.callbacks.onAction("Le sous-système 3D modulaire prend le contrôle de BlueFox.");
       global.dispatchEvent(new CustomEvent("bluefox:scene-images"));
       BF.currentEngine = this;
       BF.getDiagnostics = () => this.getDiagnostics();
+      if (BF.Missions?.MissionManager) {
+        this.missionManager = BF.Missions.MissionManager.create({
+          engine: this
+        });
+        BF.getMissionState = () => this.missionManager.getState();
+        BF.startMission = (missionId, options) =>
+          this.missionManager.startMission(missionId, options);
+        BF.setPrimaryMission = (missionId) =>
+          this.missionManager.setPrimaryMission(missionId);
+        BF.suggestMissionPriority = (missionId) =>
+          this.missionManager.suggestPrimaryMission(missionId);
+        BF.pauseMission = (missionId, reason) =>
+          this.missionManager.pauseMission(missionId, reason);
+        BF.resumeMission = (missionId, options) =>
+          this.missionManager.resumeMission(missionId, options);
+        BF.failMission = (missionId, reason) =>
+          this.missionManager.failMission(missionId, reason);
+        BF.triggerMission = (missionId, options = {}) =>
+          this.missionManager.notifyMissionEvent(options.type || "event", {
+            ...options,
+            missionId
+          });
+        BF.setSiteStage = (mapId, stage, detail) =>
+          this.missionManager.catalogController?.registerSiteStage(
+            mapId,
+            stage,
+            detail
+          ) || false;
+      }
       this.loop();
       return this;
     }
@@ -189,9 +228,19 @@
     restoreDiscovery() {
       try {
         const memories = JSON.parse(
-          localStorage.getItem("bluefox_discovered_maps_v1") || "[]"
+          localStorage.getItem("bluefox_engine_discovered_maps_v2") ||
+          localStorage.getItem("bluefox_discovered_maps_v1") ||
+          "[]"
         );
-        memories.forEach((map) => this.discoveredMaps.add(map.id));
+        const orderedMemories = memories
+          .filter((map) => map?.id && BF.maps[map.id])
+          .sort((left, right) =>
+            (Number(left.order) || Number.MAX_SAFE_INTEGER) -
+            (Number(right.order) || Number.MAX_SAFE_INTEGER)
+          );
+        this.discoveredMaps.clear();
+        if (BF.maps.crystal) this.discoveredMaps.add("crystal");
+        orderedMemories.forEach((map) => this.discoveredMaps.add(map.id));
       } catch {
         localStorage.removeItem("bluefox_discovered_maps_v1");
       }
@@ -211,6 +260,212 @@
       global.BlueFox3D.discoveredZones = this.discoveredZones;
     }
 
+    discoveryNumber(mapId) {
+      const index = [...this.discoveredMaps].indexOf(mapId);
+      if (index >= 0) return index + 1;
+      return BF.maps[mapId] ? this.discoveredMaps.size + 1 : null;
+    }
+
+    restoreGeneratedTopology() {
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem("bluefox_generated_topology_v1") || "[]"
+        );
+        if (!Array.isArray(saved)) return;
+        this.generatedTopology = saved.filter((link) =>
+          this.applyGeneratedLink(link)
+        );
+        if (this.generatedTopology.length !== saved.length) {
+          localStorage.setItem(
+            "bluefox_generated_topology_v1",
+            JSON.stringify(this.generatedTopology)
+          );
+        }
+      } catch {
+        localStorage.removeItem("bluefox_generated_topology_v1");
+        this.generatedTopology = [];
+      }
+    }
+
+    restoreMapNames() {
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem("bluefox_map_names_v1") || "{}"
+        );
+        if (!saved || typeof saved !== "object" || Array.isArray(saved)) return;
+        Object.entries(saved).forEach(([mapId, name]) => {
+          if (!BF.maps[mapId] || typeof name !== "string" || !name.trim()) return;
+          const resolvedName = name.trim();
+          BF.maps[mapId].name = resolvedName;
+          this.mapNames.set(mapId, resolvedName);
+        });
+      } catch {
+        localStorage.removeItem("bluefox_map_names_v1");
+        this.mapNames.clear();
+      }
+    }
+
+    sceneIdentity(definition) {
+      if (!definition) return "";
+      const catalogScene =
+        global.BLUEFOX_MAP_ASSETS?.catalog?.maps?.find(
+          (map) => map.id === definition.id || map.number === definition.number
+        )?.scene?.url;
+      const source =
+        definition.sceneUrl ||
+        catalogScene ||
+        this.assets?.[definition.sceneAsset] ||
+        definition.sceneAsset ||
+        "";
+      try {
+        return decodeURIComponent(String(source))
+          .replace(/\\/g, "/")
+          .split(/[?#]/)[0]
+          .toLocaleLowerCase("fr");
+      } catch {
+        return String(source)
+          .replace(/\\/g, "/")
+          .split(/[?#]/)[0]
+          .toLocaleLowerCase("fr");
+      }
+    }
+
+    ensureUniqueMapName(mapId) {
+      const definition = BF.maps[mapId];
+      if (!definition) return "";
+      const savedName = this.mapNames.get(mapId);
+      if (savedName) {
+        definition.name = savedName;
+        return savedName;
+      }
+
+      const normalize = (value) => String(value || "")
+        .toLocaleLowerCase("fr")
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .trim();
+      const discoveredDefinitions = [...this.discoveredMaps]
+        .filter((id) => id !== mapId && BF.maps[id])
+        .map((id) => BF.maps[id]);
+      const sceneKey = this.sceneIdentity(definition);
+      const duplicateScene = Boolean(sceneKey) && discoveredDefinitions.some(
+        (map) => this.sceneIdentity(map) === sceneKey
+      );
+      const duplicateName = discoveredDefinitions.some(
+        (map) => normalize(map.name) === normalize(definition.name)
+      );
+      if (!duplicateScene && !duplicateName) return definition.name;
+
+      const namesByProfile = {
+        volcanic: [
+          "La Cicatrice d’Aube", "Les Forges Rouges", "Le Seuil de Braise",
+          "La Caldeira Murmurante"
+        ],
+        frozen: [
+          "Le Silence Boréal", "Les Éclats de Givre", "La Veille Blanche",
+          "Le Miroir des Brumes"
+        ],
+        forest: [
+          "La Canopée des Veilleurs", "Le Jardin des Échos", "Les Racines Célestes",
+          "La Clairière Patiente"
+        ],
+        ruins: [
+          "Les Vestiges Endormis", "La Cité des Silences", "Le Passage des Anciens",
+          "Les Arches Oubliées"
+        ],
+        aquatic: [
+          "Le Lagon des Lueurs", "Les Profondeurs Calmes", "La Mer des Murmures",
+          "L’Archipel Opalin"
+        ],
+        desert: [
+          "La Mer de Sable", "Les Dunes du Veilleur", "Le Désert des Deux Lunes",
+          "La Vallée Sèche"
+        ],
+        crystalline: [
+          "Le Champ des Résonances", "Les Flèches d’Azur", "La Plaine Prismatique",
+          "Le Sanctuaire de Verre"
+        ],
+        alien: [
+          "L’Horizon Inconnu", "La Terre des Signes", "Le Domaine des Échos",
+          "La Frontière Silencieuse"
+        ]
+      };
+      const candidates = namesByProfile[definition.profile] || namesByProfile.alien;
+      let hash = 2166136261;
+      for (const character of `${mapId}:${definition.seed}:${definition.name}`) {
+        hash ^= character.charCodeAt(0);
+        hash = Math.imul(hash, 16777619);
+      }
+      const usedNames = new Set(
+        Object.values(BF.maps).map((map) => normalize(map.name))
+      );
+      let chosen = "";
+      for (let offset = 0; offset < candidates.length; offset += 1) {
+        const candidate = candidates[((hash >>> 0) + offset) % candidates.length];
+        if (!usedNames.has(normalize(candidate))) {
+          chosen = candidate;
+          break;
+        }
+      }
+      if (!chosen) {
+        const base = candidates[(hash >>> 0) % candidates.length];
+        let suffix = 2;
+        chosen = `${base} ${suffix}`;
+        while (usedNames.has(normalize(chosen))) {
+          suffix += 1;
+          chosen = `${base} ${suffix}`;
+        }
+      }
+
+      definition.name = chosen;
+      this.mapNames.set(mapId, chosen);
+      localStorage.setItem(
+        "bluefox_map_names_v1",
+        JSON.stringify(Object.fromEntries(this.mapNames))
+      );
+      this.callbacks.onAction(
+        `BlueFox baptise ce nouveau territoire « ${chosen} ».`
+      );
+      return chosen;
+    }
+
+    applyGeneratedLink(link) {
+      const directions = {
+        north: { x: 0, z: -26, opposite: "south" },
+        south: { x: 0, z: 26, opposite: "north" },
+        east: { x: 26, z: 0, opposite: "west" },
+        west: { x: -26, z: 0, opposite: "east" }
+      };
+      const fromMap = BF.maps[link?.from];
+      const toMap = BF.maps[link?.to];
+      const placement = directions[link?.direction];
+      if (!fromMap || !toMap || !placement) return false;
+      const reverse = directions[placement.opposite];
+      fromMap.exits[link.direction] = {
+        x: placement.x,
+        z: placement.z,
+        targetMap: toMap.id,
+        targetEntry: placement.opposite,
+        generated: true
+      };
+      toMap.exits[placement.opposite] = {
+        x: reverse.x,
+        z: reverse.z,
+        targetMap: fromMap.id,
+        targetEntry: link.direction,
+        generated: true
+      };
+      return true;
+    }
+
+    ensureMapContinuation(mapId) {
+      const definition = BF.maps[mapId];
+      if (!definition) return;
+      // Les anciennes liaisons sont restaurées par restoreGeneratedTopology().
+      // Une nouvelle destination n'est créée que sur ordre d'exploration du
+      // joueur, dans generateUnknownPassage().
+    }
+
     saveDiscovery() {
       const previous = (() => {
         try {
@@ -227,11 +482,24 @@
       const memories = [...this.discoveredMaps].map((id, index) => ({
         ...(metadata.get(id) || {}),
         id,
-        order: metadata.get(id)?.order || index + 1,
+        name: BF.maps[id]?.name || metadata.get(id)?.name,
+        sceneKey: this.sceneIdentity(BF.maps[id]),
+        order: index + 1,
         discoveredAt: metadata.get(id)?.discoveredAt || Date.now()
       }));
+      // game.js conserve un ancien catalogue React limité à crystal/jungle et
+      // déréférence directement ses entrées au rechargement. Sa vue V1 reste
+      // donc volontairement limitée aux IDs qu'il sait lire ; le moteur V2
+      // demeure la source complète pour les cartes procédurales.
+      const legacyMemories = memories.filter((map) =>
+        map.id === "crystal" || map.id === "jungle"
+      );
       localStorage.setItem(
         "bluefox_discovered_maps_v1",
+        JSON.stringify(legacyMemories)
+      );
+      localStorage.setItem(
+        "bluefox_engine_discovered_maps_v2",
         JSON.stringify(memories)
       );
       global.BlueFox3D.discoveredMaps = this.discoveredMaps;
@@ -283,14 +551,76 @@
 
     createPanorama() {
       const { THREE } = this;
-      const geometry = new THREE.SphereGeometry(105, 48, 28);
+
+      // Grand panneau incurvé conservant la perspective actuelle.
+      // Les dimensions sont légèrement augmentées pour couvrir le champ maximal
+      // sans transformer la structure générale du décor.
+      const panoramaWidth = 400;
+      const panoramaHeight = 136;
+      const geometry = new THREE.PlaneGeometry(
+        panoramaWidth,
+        panoramaHeight,
+        96,
+        22
+      );
+      const position = geometry.attributes.position;
+      const uv = geometry.attributes.uv;
+
+      for (let index = 0; index < position.count; index += 1) {
+        const x = position.getX(index);
+        const y = position.getY(index);
+        const normalized = Math.abs(x) / (panoramaWidth * 0.5);
+        const edge = Math.max(0, (normalized - 0.52) / 0.48);
+        const vertical = BF.clamp(
+          (y + panoramaHeight * 0.5) / panoramaHeight,
+          0,
+          1
+        );
+        const upperLean = Math.pow(vertical, 2);
+
+        // Le panneau descend sous le plateau et monte largement au-dessus
+        // de la limite visible de la caméra.
+        position.setY(index, -19 + vertical * 94);
+
+        // Inclinaison inversée par rapport au PATCH B1 : la base reste en retrait
+        // tandis que le haut avance progressivement vers la caméra.
+        // La courbure latérale du B1 est conservée sans autre modification.
+        position.setZ(
+          index,
+          -88 +
+          upperLean * 34 -
+          normalized * normalized * 4 -
+          edge * edge * 44
+        );
+
+        // 96 % de la texture restent consacrés à l'image normale.
+        // Les 2 % extérieurs de chaque côté sont réservés aux pixels étirés.
+        const t = x / panoramaWidth + 0.5;
+        const u = t < 0.24
+          ? (t / 0.24) * 0.02
+          : t > 0.76
+            ? 0.98 + ((t - 0.76) / 0.24) * 0.02
+            : 0.02 + ((t - 0.24) / 0.52) * 0.96;
+        uv.setX(index, u);
+      }
+
+      position.needsUpdate = true;
+      uv.needsUpdate = true;
+      geometry.computeVertexNormals();
+      geometry.computeBoundingSphere();
+
       const material = new THREE.MeshBasicMaterial({
-        side: THREE.BackSide,
+        side: THREE.DoubleSide,
         fog: false,
-        depthWrite: false
+        depthWrite: false,
+        toneMapped: false
       });
+
       this.panorama = new THREE.Mesh(geometry, material);
-      this.panorama.scale.set(1.22, 0.88, 1.22);
+      this.panorama.name = "BiomePanorama";
+      this.panorama.position.y = 0;
+      this.panorama.renderOrder = -10;
+      this.panorama.frustumCulled = false;
       this.scene.add(this.panorama);
     }
 
@@ -371,44 +701,247 @@
       this.destinationMarkerStartedAt = performance.now();
     }
 
-    setPanorama(asset) {
-      if (this.panoramaTexture) this.panoramaTexture.dispose();
+    createExtendedPanoramaTexture(image) {
+      const { THREE } = this;
+      const sourceWidth = Math.max(1, image.naturalWidth || image.width || 1);
+      const sourceHeight = Math.max(1, image.naturalHeight || image.height || 1);
+
+      // PATCH A V16.21 : cadrage vertical conservé.
+      // Le haut de l'image reste intact et les 9 % inférieurs sont retirés
+      // afin de laisser davantage de place au ciel.
+      const visibleSourceHeight = Math.max(
+        1,
+        Math.round(sourceHeight * 0.91)
+      );
+
+      // PATCH C V16.21 : extension latérale progressive.
+      // Les marges sont plus larges que dans la V16.20 et ne sont plus
+      // remplies par une simple colonne de pixels étirée uniformément.
+      const sideFill = Math.max(24, Math.round(sourceWidth * 0.075));
+      const topFill = Math.max(4, Math.round(sourceHeight * 0.012));
+      const bottomFill = Math.max(12, sourceHeight - visibleSourceHeight);
+
+      const canvas = document.createElement("canvas");
+      canvas.width = sourceWidth + sideFill * 2;
+      canvas.height = visibleSourceHeight + topFill + bottomFill;
+      const context = canvas.getContext("2d", { alpha: false });
+
+      if (!context) {
+        const fallback = new THREE.Texture(image);
+        fallback.needsUpdate = true;
+        fallback.colorSpace = THREE.SRGBColorSpace;
+        fallback.wrapS = THREE.ClampToEdgeWrapping;
+        fallback.wrapT = THREE.ClampToEdgeWrapping;
+        return fallback;
+      }
+
+      context.imageSmoothingEnabled = true;
+      context.imageSmoothingQuality = "high";
+
+      // Partie centrale : largeur complète, haut conservé, bas recadré.
+      context.drawImage(
+        image,
+        0,
+        0,
+        sourceWidth,
+        visibleSourceHeight,
+        sideFill,
+        topFill,
+        sourceWidth,
+        visibleSourceHeight
+      );
+
+      // Étire progressivement une petite bande située au bord de l'image.
+      // Les bandes restent fines près de la jonction puis deviennent plus
+      // larges vers l'extérieur, ce qui évite l'effet de colonne répétée.
+      const drawProgressiveSide = (isLeft) => {
+        const strips = 36;
+        const sourceBand = Math.max(8, Math.round(sourceWidth * 0.045));
+
+        for (let index = 0; index < strips; index += 1) {
+          const t0 = index / strips;
+          const t1 = (index + 1) / strips;
+          const eased0 = Math.pow(t0, 1.7);
+          const eased1 = Math.pow(t1, 1.7);
+
+          const destinationStart = Math.round(sideFill * t0);
+          const destinationEnd = Math.round(sideFill * t1);
+          const destinationWidth = Math.max(1, destinationEnd - destinationStart);
+
+          // À la jonction, on prélève presque le pixel extérieur. En allant
+          // vers le bord du canvas, on utilise progressivement une zone plus
+          // profonde du bord de l'image, puis on l'étire davantage.
+          const sampleDepth = Math.max(1, Math.round(sourceBand * (eased1 - eased0)));
+          const sampleOffset = Math.round(sourceBand * eased0);
+
+          const sourceX = isLeft
+            ? Math.min(sourceWidth - 1, sampleOffset)
+            : Math.max(0, sourceWidth - sampleOffset - sampleDepth);
+
+          const destinationX = isLeft
+            ? sideFill - destinationEnd
+            : sideFill + sourceWidth + destinationStart;
+
+          context.drawImage(
+            image,
+            sourceX,
+            0,
+            sampleDepth,
+            visibleSourceHeight,
+            destinationX,
+            topFill,
+            destinationWidth,
+            visibleSourceHeight
+          );
+        }
+
+        // Fusion légère au raccord pour rendre la transition imperceptible.
+        const seamWidth = Math.max(6, Math.round(sourceWidth * 0.006));
+        const gradient = context.createLinearGradient(
+          isLeft ? sideFill - seamWidth : sideFill + sourceWidth,
+          0,
+          isLeft ? sideFill : sideFill + sourceWidth + seamWidth,
+          0
+        );
+        gradient.addColorStop(0, "rgba(0,0,0,0)");
+        gradient.addColorStop(1, "rgba(0,0,0,0.18)");
+        context.save();
+        context.globalCompositeOperation = "source-over";
+        context.fillStyle = gradient;
+        context.fillRect(
+          isLeft ? sideFill - seamWidth : sideFill + sourceWidth,
+          topFill,
+          seamWidth,
+          visibleSourceHeight
+        );
+        context.restore();
+      };
+
+      drawProgressiveSide(true);
+      drawProgressiveSide(false);
+
+      // Haut : première ligne de l'image centrale et des extensions.
+      context.drawImage(
+        canvas,
+        0,
+        topFill,
+        canvas.width,
+        1,
+        0,
+        0,
+        canvas.width,
+        topFill
+      );
+
+      // Bas : dernière ligne de la zone conservée.
+      const visibleBottomY = topFill + visibleSourceHeight - 1;
+      context.drawImage(
+        canvas,
+        0,
+        visibleBottomY,
+        canvas.width,
+        1,
+        0,
+        topFill + visibleSourceHeight,
+        canvas.width,
+        bottomFill
+      );
+
+      const texture = new THREE.CanvasTexture(canvas);
+      texture.colorSpace = THREE.SRGBColorSpace;
+      texture.wrapS = THREE.ClampToEdgeWrapping;
+      texture.wrapT = THREE.ClampToEdgeWrapping;
+      texture.minFilter = THREE.LinearMipmapLinearFilter;
+      texture.magFilter = THREE.LinearFilter;
+      texture.generateMipmaps = true;
+      texture.anisotropy = Math.min(
+        8,
+        this.renderer?.capabilities?.getMaxAnisotropy?.() || 1
+      );
+      texture.needsUpdate = true;
+      return texture;
+    }
+
+    async setPanorama(asset, definition = BF.maps[this.currentMapId]) {
       const loader = new this.THREE.TextureLoader();
+      const catalogMap = global.BLUEFOX_MAP_ASSETS?.catalog?.maps?.find(
+        (map) => map.number === definition?.number
+      );
+
+      // Source autoritaire : l'image N... portant le même numéro que la Map.
+      asset = catalogMap?.scene?.url || definition?.sceneUrl || asset;
+      const filename = String(asset || "").split("/").pop();
+      const isTerrain = Boolean(
+        global.BLUEFOX_MAP_ASSETS?.parseTerrain?.({ name: filename })
+      );
+
+      if (isTerrain) {
+        asset = catalogMap?.scene?.url || definition?.sceneUrl || asset;
+      }
+
+      this.currentPanoramaAsset = asset;
+      const requestedAsset = asset;
+
+      // Retire immédiatement l'ancien panorama afin qu'aucune image résiduelle
+      // ne puisse réapparaître pendant le chargement asynchrone de la suivante.
+      if (this.panorama) {
+        this.panorama.visible = false;
+        this.panorama.material.map = null;
+        this.panorama.material.needsUpdate = true;
+      }
+      if (this.panoramaTexture) {
+        this.panoramaTexture.dispose();
+        this.panoramaTexture = null;
+      }
+
       const candidates =
         global.BLUEFOX_MAP_ASSETS?.imageUrlCandidates?.(asset) || [asset];
-      let panoramaTexture;
-      const attempt = (index) => {
-        const candidate = candidates[index];
-        const loadedTexture = loader.load(
-          candidate,
-          (texture) => {
-            if (panoramaTexture && texture !== panoramaTexture) {
-              panoramaTexture.image = texture.image;
-              panoramaTexture.needsUpdate = true;
-            }
-          },
-          undefined,
-          () => {
-            if (index + 1 < candidates.length) {
-              attempt(index + 1);
-            } else {
-              global.dispatchEvent(new CustomEvent("bluefox:image-missing", {
-                detail: {
-                  source: asset,
-                  role: "scène panoramique",
-                  mapId: this.currentMapId
-                }
-              }));
-            }
+
+      const loadCandidate = (candidate) => new Promise((resolve, reject) => {
+        loader.load(candidate, resolve, undefined, reject);
+      });
+
+      for (const candidate of candidates) {
+        try {
+          const sourceTexture = await loadCandidate(candidate);
+
+          // Ignore une réponse devenue obsolète si une autre map a été demandée.
+          if (this.currentPanoramaAsset !== requestedAsset) {
+            sourceTexture?.dispose?.();
+            return false;
           }
-        );
-        if (!panoramaTexture) panoramaTexture = loadedTexture;
-      };
-      attempt(0);
-      this.panoramaTexture = panoramaTexture;
-      this.panoramaTexture.colorSpace = this.THREE.SRGBColorSpace;
-      this.panorama.material.map = this.panoramaTexture;
-      this.panorama.material.needsUpdate = true;
+          if (!sourceTexture?.image) {
+            sourceTexture?.dispose?.();
+            continue;
+          }
+
+          const extendedTexture = this.createExtendedPanoramaTexture(
+            sourceTexture.image
+          );
+
+          this.panoramaTexture = extendedTexture;
+          this.panorama.material.map = extendedTexture;
+          this.panorama.material.needsUpdate = true;
+          this.panorama.visible = true;
+
+          // La texture source n'est plus utilisée après création du canvas.
+          if (sourceTexture !== extendedTexture) sourceTexture.dispose();
+          return true;
+        } catch {
+          // Essaie le chemin candidat suivant.
+        }
+      }
+
+      if (this.currentPanoramaAsset === requestedAsset) {
+        global.dispatchEvent(new CustomEvent("bluefox:image-missing", {
+          detail: {
+            source: asset,
+            role: "scène panoramique",
+            mapId: this.currentMapId
+          }
+        }));
+      }
+      return false;
     }
 
     createTransitionElement() {
@@ -531,10 +1064,11 @@
       const minuteOfDay = Math.floor(totalMinutes % minutesPerDay);
       const hour = Math.floor(minuteOfDay / 60);
       const minute = minuteOfDay % 60;
-      const isNight = hour < 5 || hour >= 16;
+      // Cycle de 20 h : 15 h de jour et seulement 5 h de nuit.
+      const isNight = hour < 2 || hour >= 17;
       const daylight = isNight
         ? 0
-        : Math.sin(((minuteOfDay - 5 * 60) / (11 * 60)) * Math.PI);
+        : Math.sin(((minuteOfDay - 2 * 60) / (15 * 60)) * Math.PI);
 
       const block = document.querySelector(".day-block");
       if (block) {
@@ -561,14 +1095,14 @@
         1
       );
       this.sun.intensity = BF.damp(this.sun.intensity, 0.45 + daylight * 3.8, 2, 1);
-      this.fill.intensity = BF.damp(this.fill.intensity, isNight ? 12 : 7, 2, 1);
+      this.fill.intensity = BF.damp(this.fill.intensity, isNight ? 1.7 : 0.75, 2, 1);
       if (this.biomeParticles && this.biomeParticleSettings) {
         this.biomeParticles.material.opacity =
           this.biomeParticleSettings.baseOpacity * (isNight ? 1.15 : 0.78);
       }
       this.renderer.toneMappingExposure = BF.damp(
         this.renderer.toneMappingExposure,
-        isNight ? 0.82 : 1.14,
+        isNight ? 0.88 : 1.06,
         2,
         1
       );
@@ -605,9 +1139,23 @@
           event.clientX - this.pointerDown.x,
           event.clientY - this.pointerDown.y
         ) > 8) return;
-        this.handlePointer(event);
+        window.clearTimeout(this.pointerClickTimer);
+        const pointer = {
+          clientX: event.clientX,
+          clientY: event.clientY
+        };
+        this.pointerClickTimer = window.setTimeout(
+          () => this.handlePointer(pointer, "run"),
+          220
+        );
+      };
+      this.onWorldDoubleClick = (event) => {
+        event.preventDefault();
+        window.clearTimeout(this.pointerClickTimer);
+        this.handlePointer(event, "run-fast");
       };
       this.onNavigate = (event) => this.handleNavigationSuggestion(event.detail);
+      this.onReturnBase = () => this.returnToBase();
       this.onPathPlanned = (event) => this.updatePathVisual(event.detail);
       this.onNavigationFailed = () => {
         this.navigationFailures += 1;
@@ -616,6 +1164,7 @@
         this.pendingInteraction = null;
         this.pendingGate = null;
         this.pendingZoneExploration = null;
+        this.returningToBase = false;
         this.interactionStartedAt = 0;
         this.interactionApproachStartedAt = 0;
         this.interactionApproachAttempts = 0;
@@ -626,10 +1175,15 @@
         this.callbacks.onStatus(
           wasResource
             ? "BlueFox change d’approche : cette ressource est momentanément inaccessible."
-            : wasGate
-              ? "BlueFox interrompt ce trajet vers le passage et réévalue la route."
-              : "BlueFox abandonne ce trajet impossible et choisit une autre destination."
+            : wasGate && this.persistentNavigationIntent
+              ? "BlueFox diffère ce passage mais conserve la destination suggérée."
+              : wasGate
+                ? "BlueFox interrompt ce trajet vers le passage et réévalue la route."
+                : "BlueFox abandonne ce trajet impossible et choisit une autre destination."
         );
+        if (this.persistentNavigationIntent) {
+          window.setTimeout(() => this.resumePersistentNavigation(), 900);
+        }
       };
       this.onVisibilityChange = () => {
         if (document.visibilityState !== "visible" || this.disposed) return;
@@ -649,14 +1203,51 @@
       };
       this.renderer.domElement.addEventListener("pointerdown", this.onPointerDown);
       this.renderer.domElement.addEventListener("pointerup", this.onPointerUp);
+      this.renderer.domElement.addEventListener("dblclick", this.onWorldDoubleClick);
       global.addEventListener("bluefox:navigate", this.onNavigate);
+      global.addEventListener("bluefox:return-base", this.onReturnBase);
       global.addEventListener("bluefox:path-planned", this.onPathPlanned);
       global.addEventListener("bluefox:navigation-failed", this.onNavigationFailed);
       document.addEventListener("visibilitychange", this.onVisibilityChange);
     }
 
-    handlePointer(event) {
+    moveToBaseCamp() {
+      const camp = new this.THREE.Vector3(0, 0, 8);
+      this.pendingInteraction = null;
+      this.pendingGate = null;
+      this.character.setTarget(camp, "run");
+      this.showWorldMarker(camp);
+      this.callbacks.onStatus("BlueFox revient vers le refuge.");
+    }
+
+    returnToBase() {
       if (this.transitioning) return;
+      if (this.currentMapId === "crystal") {
+        this.returningToBase = false;
+        this.moveToBaseCamp();
+        return;
+      }
+
+      const route = this.findKnownRoute(this.currentMapId, "crystal");
+      if (!route || route.length < 2) {
+        this.returningToBase = false;
+        this.callbacks.onStatus(
+          "Aucun itinéraire mémorisé ne permet encore de rejoindre le refuge."
+        );
+        return;
+      }
+      this.pendingInteraction = null;
+      this.navigationRoute = route.slice(1);
+      this.returningToBase = true;
+      this.callbacks.onStatus(
+        "BlueFox utilise les passages mémorisés pour revenir à la base."
+      );
+      this.navigateNextRouteStep();
+    }
+
+    handlePointer(event, movementMode = "run") {
+      if (this.transitioning) return;
+      this.navigationRoute = [];
       this.showClickMarker(event);
       const rect = this.renderer.domElement.getBoundingClientRect();
       this.pointer.set(
@@ -671,36 +1262,238 @@
       );
       if (hits.length) {
         const object = hits[0].object;
-        if (object.userData.active) this.targetInteraction(object);
+        if (object.userData.active) {
+          object.userData.requestedMovementMode = movementMode;
+          object.userData.requestedInteractionSource = "manual";
+          this.targetInteraction(object);
+        }
         return;
       }
 
       const point = new this.THREE.Vector3();
       if (!this.raycaster.ray.intersectPlane(this.groundPlane, point)) return;
-      point.x = BF.clamp(point.x, -27, 27);
-      point.z = BF.clamp(point.z, -27, 27);
+      const mapBounds = this.currentMap?.bounds || 27;
+      point.x = BF.clamp(point.x, -mapBounds, mapBounds);
+      point.z = BF.clamp(point.z, -mapBounds, mapBounds);
       this.pendingInteraction = null;
       this.pendingZoneExploration = null;
       this.character.cancelInteraction();
-      this.character.setTarget(point);
+      this.character.setTarget(point, movementMode);
       this.showWorldMarker(point);
       this.callbacks.onStatus("BlueFox suit progressivement la destination suggérée.");
     }
 
-    handleNavigationSuggestion(detail) {
-      if (!detail || this.transitioning) return;
-      if (detail.mapId && detail.mapId !== this.currentMapId) {
-        const gate = this.currentMap.gates.find(
-          (candidate) => candidate.userData.exit.targetMap === detail.mapId
+
+    addRuntimeGate(direction, exit, definition = BF.maps[this.currentMapId]) {
+      if (!direction || !exit || !this.currentMap?.group || !definition) return null;
+      const existing = this.currentMap.gates?.find(
+        (gate) => gate.userData?.exit?.targetMap === exit.targetMap
+      );
+      if (existing) return existing;
+
+      const bounds = this.currentMap.bounds || 27;
+      const resolved = { ...exit };
+      if (direction === "north") {
+        resolved.z = -bounds + 1.2;
+        resolved.x = BF.clamp(Number(exit.x) || 0, -bounds + 4, bounds - 4);
+      } else if (direction === "south") {
+        resolved.z = bounds - 1.2;
+        resolved.x = BF.clamp(Number(exit.x) || 0, -bounds + 4, bounds - 4);
+      } else if (direction === "east") {
+        resolved.x = bounds - 1.2;
+        resolved.z = BF.clamp(Number(exit.z) || 0, -bounds + 4, bounds - 4);
+      } else if (direction === "west") {
+        resolved.x = -bounds + 1.2;
+        resolved.z = BF.clamp(Number(exit.z) || 0, -bounds + 4, bounds - 4);
+      } else {
+        return null;
+      }
+
+      definition.runtimeExits = definition.runtimeExits || {};
+      definition.runtimeExits[direction] = resolved;
+
+      const gate = new this.THREE.Group();
+      gate.position.set(resolved.x, 0, resolved.z);
+      gate.rotation.y =
+        direction === "east" || direction === "west" ? Math.PI / 2 : 0;
+      gate.userData.exit = { ...resolved, direction };
+      gate.userData.triggerRadius = 2.35;
+      gate.userData.runtimeGenerated = true;
+
+      const arch = new this.THREE.Mesh(
+        new this.THREE.TorusGeometry(2.15, 0.17, 18, 64, Math.PI),
+        new this.THREE.MeshStandardMaterial({
+          color: definition.palette.accent,
+          emissive: definition.palette.accent,
+          emissiveIntensity: 2,
+          metalness: 0.35,
+          roughness: 0.3
+        })
+      );
+      arch.position.y = 0.2;
+      gate.add(arch);
+
+      const ring = new this.THREE.Mesh(
+        new this.THREE.RingGeometry(0.9, 1.35, 48),
+        new this.THREE.MeshBasicMaterial({
+          color: definition.palette.accent,
+          transparent: true,
+          opacity: 0.7,
+          side: this.THREE.DoubleSide,
+          depthWrite: false
+        })
+      );
+      ring.rotation.x = -Math.PI / 2;
+      ring.position.y = 0.05;
+      gate.add(ring);
+
+      this.currentMap.group.add(gate);
+      this.currentMap.gates = this.currentMap.gates || [];
+      this.currentMap.gates.push(gate);
+      return gate;
+    }
+
+    async generateUnknownPassage(direction) {
+      const opposites = {
+        north: "south", south: "north", east: "west", west: "east"
+      };
+      const opposite = opposites[direction];
+      const currentDefinition = BF.maps[this.currentMapId];
+      if (!opposite || !currentDefinition) return;
+      const existing = currentDefinition.exits[direction];
+      if (existing) {
+        this.handleNavigationSuggestion({ mapId: existing.targetMap });
+        return;
+      }
+      if (!BF.MapGenerator) {
+        this.callbacks.onStatus(
+          "Le générateur de territoires n’est pas disponible."
         );
-        if (gate) {
-          this.pendingGate = gate;
-          this.character.setTarget(gate.position);
-          this.showWorldMarker(gate.position);
-          this.callbacks.onStatus(
-            `BlueFox se dirige vers le passage menant à ${BF.maps[detail.mapId].name}.`
-          );
+        return;
+      }
+      let destination;
+      try {
+        const missionState = this.missionManager?.getState?.() || BF.getMissionState?.();
+        const activeMissionCount = Array.isArray(missionState?.activeMissionIds)
+          ? missionState.activeMissionIds.length
+          : 0;
+        destination = BF.MapGenerator.generate({
+          fromMapId: this.currentMapId,
+          direction,
+          discoveryIndex: this.discoveredMaps.size,
+          ordinal: BF.MapGenerator.listSaved().length + 1,
+          lowMissionProgress: activeMissionCount <=
+            BF.MapGenerationRules.discoveryCadence.lowMissionActiveMaximum
+        });
+      } catch (error) {
+        console.error("Échec de génération de map", error);
+        this.callbacks.onStatus(
+          "Aucun territoire compatible ne peut être généré dans cette direction."
+        );
+        return;
+      }
+      const link = { from: this.currentMapId, direction, to: destination.id };
+      if (!this.applyGeneratedLink(link)) return;
+      this.generatedTopology.push(link);
+      localStorage.setItem(
+        "bluefox_generated_topology_v1",
+        JSON.stringify(this.generatedTopology)
+      );
+
+      // Ajoute seulement le nouveau portail. La map courante n'est jamais
+      // détruite ni reconstruite lors d'une suggestion d'exploration.
+      const exit = currentDefinition.exits[direction];
+      const gate = this.addRuntimeGate(direction, exit, currentDefinition);
+      if (!gate) return;
+      this.pendingGate = gate;
+      this.character.setTarget(gate.position, "run");
+      this.showWorldMarker(gate.position);
+      const frenchDirection = {
+        north: "le Nord", south: "le Sud", east: "l’Est", west: "l’Ouest"
+      }[direction];
+      this.callbacks.onStatus(
+        `BlueFox se dirige vers une terre inconnue vers ${frenchDirection}.`
+      );
+      this.callbacks.onAction(
+        "Une route vient d’être générée sur demande du joueur. Le biome reste inconnu jusqu’au passage."
+      );
+    }
+
+    narrativeMapName(mapId) {
+      return this.mapNames?.get(mapId) || BF.maps?.[mapId]?.name || "Territoire inconnu";
+    }
+
+    setPersistentNavigationIntent(detail) {
+      if (!detail) return;
+      this.persistentNavigationIntent = {
+        mapId: detail.mapId || null,
+        direction: detail.direction || null,
+        discoverUnknown: detail.discoverUnknown === true,
+        requestedAt: Date.now()
+      };
+    }
+
+    clearPersistentNavigationIntent() {
+      this.persistentNavigationIntent = null;
+    }
+
+    resumePersistentNavigation() {
+      const intent = this.persistentNavigationIntent;
+      if (!intent || this.transitioning) return false;
+      if (intent.mapId && intent.mapId === this.currentMapId) {
+        this.clearPersistentNavigationIntent();
+        return true;
+      }
+      if (this.pendingInteraction || this.currentRoutine || this.missionManager?.currentAction) {
+        return false;
+      }
+      if (intent.discoverUnknown && intent.direction) {
+        const known = BF.maps[this.currentMapId]?.exits?.[intent.direction];
+        if (known?.targetMap) {
+          intent.mapId = known.targetMap;
+          intent.discoverUnknown = false;
+        } else {
+          this.generateUnknownPassage(intent.direction);
+          return true;
         }
+      }
+      if (intent.mapId) {
+        const route = this.findKnownRoute(this.currentMapId, intent.mapId);
+        if (!route || route.length < 2) return false;
+        this.navigationRoute = route.slice(1);
+        this.navigateNextRouteStep();
+        return true;
+      }
+      return false;
+    }
+
+    handleNavigationSuggestion(detail) {
+      if (!detail) return;
+      this.setPersistentNavigationIntent(detail);
+      if (this.transitioning) return;
+      if (this.pendingInteraction || this.currentRoutine || this.missionManager?.currentAction) {
+        this.callbacks.onStatus(
+          "BlueFox termine son action en cours puis suivra la destination suggérée."
+        );
+        return;
+      }
+      if (detail.discoverUnknown && detail.direction) {
+        this.generateUnknownPassage(detail.direction);
+        return;
+      }
+      if (detail.mapId && detail.mapId !== this.currentMapId) {
+        const route = this.findKnownRoute(this.currentMapId, detail.mapId);
+        if (!route) {
+          this.callbacks.onStatus(
+            "Aucun itinéraire exploré ne relie encore ces deux Zones."
+          );
+          return;
+        }
+        this.navigationRoute = route.slice(1);
+        this.callbacks.onStatus(
+          `BlueFox prépare un itinéraire vers ${this.narrativeMapName(detail.mapId)}.`
+        );
+        this.navigateNextRouteStep();
         return;
       }
       const centerOffset = this.currentMapId === "jungle" ? 64 : 0;
@@ -709,8 +1502,55 @@
         0,
         BF.clamp(detail.z || 0, -27, 27)
       );
-      this.character.setTarget(target);
+      this.clearPersistentNavigationIntent();
+      this.character.setTarget(target, "run");
       this.showWorldMarker(target);
+    }
+
+    findKnownRoute(startMapId, targetMapId) {
+      if (startMapId === targetMapId) return [startMapId];
+      if (!this.discoveredMaps.has(targetMapId)) return null;
+      const queue = [[startMapId]];
+      const visited = new Set([startMapId]);
+      while (queue.length) {
+        const route = queue.shift();
+        const currentId = route[route.length - 1];
+        const exits = Object.values(BF.maps[currentId]?.exits || {});
+        for (const exit of exits) {
+          const nextId = exit.targetMap;
+          if (!nextId || visited.has(nextId) || !this.discoveredMaps.has(nextId)) {
+            continue;
+          }
+          const nextRoute = [...route, nextId];
+          if (nextId === targetMapId) return nextRoute;
+          visited.add(nextId);
+          queue.push(nextRoute);
+        }
+      }
+      return null;
+    }
+
+    navigateNextRouteStep() {
+      const nextMapId = this.navigationRoute[0];
+      if (!nextMapId || nextMapId === this.currentMapId) {
+        if (nextMapId === this.currentMapId) this.navigationRoute.shift();
+        if (!this.navigationRoute.length) return;
+      }
+      const destinationId = this.navigationRoute[0];
+      const gate = this.currentMap.gates.find(
+        (candidate) => candidate.userData.exit.targetMap === destinationId
+      );
+      if (!gate) {
+        this.navigationRoute = [];
+        this.callbacks.onStatus("L’itinéraire mémorisé est devenu impraticable.");
+        return;
+      }
+      this.pendingGate = gate;
+      this.character.setTarget(gate.position, "run");
+      this.showWorldMarker(gate.position);
+      this.callbacks.onStatus(
+        `BlueFox rejoint le passage vers ${this.narrativeMapName(destinationId)}.`
+      );
     }
 
     interactionApproachPoint(object, attempt = 0) {
@@ -738,7 +1578,8 @@
           0,
           anchor.position.z + Math.sin(angle) * approachDistance
         );
-        if (Math.abs(point.x) > 26.6 || Math.abs(point.z) > 26.6) continue;
+        const mapBounds = (this.currentMap?.bounds || 27) - 0.4;
+        if (Math.abs(point.x) > mapBounds || Math.abs(point.z) > mapBounds) continue;
         const clear = colliders.every((collider) =>
           point.distanceTo(collider.position) >=
             this.character.radius + collider.radius + 0.16
@@ -772,6 +1613,99 @@
       };
     }
 
+
+    interactionProfile(object) {
+      const data = object?.userData || {};
+      const functional = data.functional || {};
+      const interaction = functional.interaction || data.interaction || {};
+      const gameplay = functional.gameplay || data.gameplay || {};
+      const actions = new Set(interaction.actions || []);
+      const kind = String(
+        functional.resource?.inventoryKey ||
+        functional.type ||
+        data.kind ||
+        "unknown"
+      );
+      const configuredAction = String(
+        interaction.defaultManualAction ||
+        interaction.defaultAction ||
+        data.defaultAction ||
+        ""
+      ).toLowerCase();
+      const action = actions.has(configuredAction)
+        ? configuredAction
+        : actions.has("extract")
+          ? "extract"
+          : actions.has("collect")
+            ? "collect"
+            : actions.has("analyze")
+              ? "analyze"
+              : actions.has("inspect")
+                ? "inspect"
+                : actions.has("observe")
+                  ? "observe"
+                  : "";
+      const label = interaction.label || functional.label || data.label || "l’objet";
+      const collectable = action === "collect" || action === "extract";
+      const removeFromWorld =
+        interaction.removeFromWorld ??
+        (collectable && gameplay.collectable === true);
+      const actionText = {
+        collect: `BlueFox collecte ${label}.`,
+        extract: `BlueFox extrait une ressource de ${label}.`,
+        inspect: `BlueFox inspecte attentivement ${label}.`,
+        observe: `BlueFox observe ${label} sans le perturber.`,
+        analyze: `BlueFox analyse méthodiquement ${label}.`
+      }[action] || `BlueFox interagit avec ${label}.`;
+      const approachText = {
+        collect: `BlueFox approche ${label} avant la collecte.`,
+        extract: `BlueFox approche ${label} avant l’extraction.`,
+        inspect: `BlueFox approche ${label} pour l’inspecter.`,
+        observe: `BlueFox se place près de ${label} pour l’observer.`,
+        analyze: `BlueFox approche ${label} pour l’analyser.`
+      }[action] || `BlueFox approche ${label}.`;
+      const speechText = {
+        collect: `Je collecte ${label} avec précaution.`,
+        extract: `J’extrais seulement ce qui est utile de ${label}.`,
+        inspect: `J’inspecte ${label} avant de tirer des conclusions.`,
+        observe: `J’observe ${label} sans intervenir.`,
+        analyze: `J’analyse ${label} et j’enregistre les résultats.`
+      }[action] || `J’examine ${label}.`;
+      return {
+        kind,
+        action,
+        label,
+        collectable,
+        removeFromWorld,
+        respawnMs: Number.isFinite(Number(interaction.respawnSeconds))
+          ? Number(interaction.respawnSeconds) * 1000
+          : null,
+        animationHints: interaction.animation?.[action] || [],
+        actionText,
+        approachText,
+        speechText
+      };
+    }
+
+    canInteractWith(object, now = performance.now()) {
+      if (!object?.userData?.active) return false;
+      const last = Number(object.userData.lastInteractionAt || 0);
+      const profile = this.interactionProfile(object);
+      if (!profile.action) return false;
+      return profile.collectable || now - last > 30000;
+    }
+
+    missionActionForInteraction(action) {
+      const types = BF.Missions?.ActionType || {};
+      return {
+        collect: types.COLLECT,
+        extract: types.EXTRACT || types.COLLECT,
+        inspect: types.INSPECT || types.OBSERVE,
+        observe: types.OBSERVE,
+        analyze: types.ANALYZE || types.OBSERVE
+      }[action];
+    }
+
     targetInteraction(object, retry = false) {
       this.pendingZoneExploration = null;
       const approach = this.interactionApproachPoint(
@@ -780,21 +1714,85 @@
       );
       this.pendingInteraction = object;
       object.userData.approachDistance = approach.approachDistance;
+      object.userData.interactionProfile = this.interactionProfile(object);
       this.interactionStartedAt = 0;
       this.interactionApproachStartedAt = performance.now();
       if (!retry) this.interactionApproachAttempts = 0;
-      this.character.setTarget(approach.point);
-      this.showWorldMarker(approach.point);
-      this.callbacks.onStatus(
-        object.userData.kind === "crystal"
-          ? "BlueFox approche le cristal avant de le récolter."
-          : "BlueFox approche les fibres avant de les prélever."
+      this.character.setTarget(
+        approach.point,
+        object.userData.requestedMovementMode || "auto"
       );
+      this.showWorldMarker(approach.point);
+      this.callbacks.onStatus(object.userData.interactionProfile.approachText);
+    }
+
+    async addCrashCapsule(map, definition) {
+      const crashSite = definition?.crashSite;
+      if (!map?.group || !crashSite?.capsuleAsset || !this.GLTFLoader) return false;
+
+      try {
+        const gltf = await new Promise((resolve, reject) => {
+          new this.GLTFLoader().load(
+            crashSite.capsuleAsset,
+            resolve,
+            undefined,
+            reject
+          );
+        });
+        const capsule = gltf.scene;
+        const anchor = crashSite.capsuleAnchor || { x: 0, y: 0, z: 0 };
+        const scale = Math.max(0.01, Number(crashSite.capsuleScale) || 1);
+        capsule.name = "BlueFoxStartCapsule";
+        capsule.position.set(
+          Number(anchor.x) || 0,
+          (Number(anchor.y) || 0) +
+            Math.max(0, Number(crashSite.capsuleGroundOffset) || 0),
+          Number(anchor.z) || 0
+        );
+        capsule.rotation.y = Number(crashSite.capsuleRotation) || 0;
+        capsule.scale.setScalar(scale);
+        capsule.userData.landmark = "crash-capsule";
+        capsule.userData.mapId = definition.id;
+        capsule.traverse((child) => {
+          if (!child.isMesh) return;
+          child.castShadow = true;
+          child.receiveShadow = true;
+          child.frustumCulled = false;
+        });
+        map.group.add(capsule);
+        map.crashCapsule = capsule;
+
+        const colliderOffsets = [-2.35, 0, 2.35];
+        colliderOffsets.forEach((offsetX) => {
+          const offset = new this.THREE.Vector3(offsetX * scale, 0, 0)
+            .applyAxisAngle(
+              new this.THREE.Vector3(0, 1, 0),
+              capsule.rotation.y
+            );
+          map.colliders.push({
+            position: new this.THREE.Vector3(
+              capsule.position.x + offset.x,
+              0,
+              capsule.position.z + offset.z
+            ),
+            radius: 1.85 * scale,
+            owner: capsule
+          });
+        });
+        return true;
+      } catch (error) {
+        console.error("Chargement de la capsule de départ impossible.", error);
+        this.callbacks.onStatus(
+          "La capsule 3D de la map de départ n’a pas pu être chargée."
+        );
+        return false;
+      }
     }
 
     async loadMap(mapId, entry, announce = true) {
       const definition = BF.maps[mapId];
       if (!definition) throw new Error(`Map inconnue: ${mapId}`);
+      this.ensureMapContinuation(mapId);
       const previousMap = this.currentMap;
       const nextMap = BF.buildMap(
         this.THREE,
@@ -802,19 +1800,47 @@
         this.assets,
         this.renderer
       );
+      await this.addCrashCapsule(nextMap, definition);
       this.scene.add(nextMap.group);
       this.currentMap = nextMap;
-      this.character?.setColliders(nextMap.colliders);
-      this.setPanorama(definition.sceneUrl || this.assets[definition.sceneAsset]);
-      this.applyBiomeAtmosphere(definition);
       this.currentMapId = mapId;
+      global.dispatchEvent(new CustomEvent("bluefox:map-state", {
+        detail: {
+          mapId,
+          number: this.discoveryNumber(mapId),
+          name: definition.name,
+          sceneUrl:
+            global.BLUEFOX_MAP_ASSETS?.catalog?.maps?.find(
+              (map) => map.number === definition.number
+            )?.scene?.url ||
+            definition.sceneUrl ||
+            this.assets[definition.sceneAsset]
+        }
+      }));
+      if (this.character?.pathPlanner) {
+        this.character.pathPlanner.bounds = nextMap.bounds || 27;
+      }
+      this.character?.setColliders(nextMap.colliders);
+      await this.setPanorama(
+        definition.sceneUrl || this.assets[definition.sceneAsset],
+        definition
+      );
+      this.applyBiomeAtmosphere(definition);
       this.currentZoneIndex = -1;
       this.pendingZoneExploration = null;
+      // Évite que l’ancien plateau reste superposé au nouveau (z-fighting).
+      previousMap?.group?.removeFromParent();
       previousMap?.dispose();
+      BF.bibleRuntime?.renderCurrentSite?.(this);
       if (announce) {
-        this.callbacks.onMapChange(mapId);
-        this.callbacks.onAction(`Map chargée : ${definition.name}.`);
+        if (mapId === "crystal" || mapId === "jungle") {
+          this.callbacks.onMapChange(mapId);
+        }
+        this.callbacks.onAction(`Zone chargée : ${this.narrativeMapName(mapId)}.`);
       }
+      this.__bacTargetLock = null;
+      this.lastAutonomyAt = performance.now() - 5200;
+      this.lastActivityAt = performance.now();
       this.updateCurrentZone(performance.now(), true);
       return entry;
     }
@@ -833,13 +1859,13 @@
         },
         forest: {
           sky: 0x071b19, fog: 0x163c35, density: 0.014,
-          hemiSky: 0x8fffd5, hemiGround: 0x172b25,
-          sun: 0xb8ffd9, fill: 0x4effb4
+          hemiSky: 0xd8eee4, hemiGround: 0x27312e,
+          sun: 0xfff4dc, fill: 0xb9d8ca
         },
         ruins: {
           sky: 0x091a20, fog: 0x183b39, density: 0.012,
-          hemiSky: 0x9ee8d4, hemiGround: 0x263a35,
-          sun: 0xd0f5df, fill: 0x63ffc2
+          hemiSky: 0xd7e9e1, hemiGround: 0x303734,
+          sun: 0xfff1d7, fill: 0xb9d2c7
         },
         aquatic: {
           sky: 0x06182b, fog: 0x0b4260, density: 0.016,
@@ -1040,31 +2066,58 @@
           nearestDistance = distance;
         }
       });
-      if (!force && nearest.index === this.currentZoneIndex) return;
+      const reachedPlannedZone =
+        this.pendingZoneExploration?.index === nearest.index;
+      if (
+        !force &&
+        nearest.index === this.currentZoneIndex &&
+        !reachedPlannedZone
+      ) return;
       this.currentZoneIndex = nearest.index;
-      const zoneKey = `${this.currentMapId}:${nearest.index}`;
+      const zoneKey = `${this.currentMapId}:map`;
       if (!this.discoveredZones.has(zoneKey)) {
         this.discoveredZones.add(zoneKey);
         this.saveZoneDiscovery();
-        this.callbacks.onAction(`Nouvelle zone explorée : ${nearest.name}.`);
+        const mapIsKnown = this.discoveredMaps.has(this.currentMapId) ||
+          this.currentMapId === "crystal";
+        this.callbacks.onAction(mapIsKnown
+          ? `Nouvelle zone explorée : ${this.currentMap.definition.name}.`
+          : "BlueFox prend pied sur une terre inconnue."
+        );
       }
-      if (this.pendingZoneExploration?.index === nearest.index) {
+      if (reachedPlannedZone) {
+        const preciseZoneKey = `${this.currentMapId}:${nearest.index}`;
+        if (!this.discoveredZones.has(preciseZoneKey)) {
+          this.discoveredZones.add(preciseZoneKey);
+          this.saveZoneDiscovery();
+        }
         this.callbacks.onStatus(
-          `BlueFox commence l’étude de ${nearest.name}.`
+          `BlueFox commence l’étude du plateau ${nearest.index + 1}.`
         );
         this.pendingZoneExploration = null;
         this.lastAutonomyAt = now - 5000;
+        this.missionManager?.notifyActionCompleted(
+          BF.Missions.ActionType.EXPLORE_ZONE,
+          {
+            mapId: this.currentMapId,
+            zoneIndex: nearest.index,
+            amount: 1
+          }
+        );
       }
-      this.callbacks.onZoneChange(this.currentMapId, nearest.name);
+      this.callbacks.onZoneChange(
+        this.currentMapId,
+        `Zone ${this.currentMap.definition.number || 1}`
+      );
     }
 
     canDiscoverMap(mapId) {
       return this.discoveredMaps.has(mapId) ||
-        (navigator.onLine && document.visibilityState === "visible");
+        document.visibilityState === "visible";
     }
 
     safeEntryPosition(targetMap, previousMapId, requestedEntry) {
-      const entries = Object.entries(targetMap.exits);
+      const entries = Object.entries(targetMap.runtimeExits || targetMap.exits);
       const matched = entries.find(([direction, candidate]) =>
         direction === requestedEntry || candidate.targetMap === previousMapId
       );
@@ -1107,11 +2160,12 @@
       this.character.enabled = false;
       this.character.stop();
       this.transitionElement.classList.add("active");
+      const preservedCameraView = this.cameraController?.captureViewState?.() || null;
       try {
         await new Promise((resolve) => setTimeout(resolve, 340));
 
         const isNew = !this.discoveredMaps.has(exit.targetMap);
-        await this.loadMap(exit.targetMap, null, true);
+        await this.loadMap(exit.targetMap, null, !isNew);
         const targetMap = BF.maps[exit.targetMap];
         const spawn = this.safeEntryPosition(
           targetMap,
@@ -1124,8 +2178,14 @@
         this.character.facePoint(new this.THREE.Vector3(0, 0, 0));
         if (isNew) {
           this.discoveredMaps.add(exit.targetMap);
+          this.ensureUniqueMapName(exit.targetMap);
           this.saveDiscovery();
-          this.callbacks.onMapDiscovered(exit.targetMap);
+          this.callbacks.onAction(
+            `Nouvelle terre découverte : ${this.narrativeMapName(exit.targetMap)}.`
+          );
+          if (exit.targetMap === "crystal" || exit.targetMap === "jungle") {
+            this.callbacks.onMapDiscovered(exit.targetMap);
+          }
         }
         this.pendingGate = null;
         this.gateCooldownUntil = performance.now() + 2600;
@@ -1134,11 +2194,29 @@
         this.savePosition();
 
         await new Promise((resolve) => setTimeout(resolve, 220));
-        this.cameraController.resetBehindCharacter(true);
+        if (!this.cameraController.restoreViewState(preservedCameraView)) {
+          this.cameraController.resetBehindCharacter(true);
+        }
         this.completedTransitions += 1;
+        if (this.persistentNavigationIntent?.mapId === this.currentMapId) {
+          this.clearPersistentNavigationIntent();
+        }
+        global.dispatchEvent(new CustomEvent("bluefox:map-transition-completed", {
+          detail: {
+            fromMapId: previousMapId,
+            mapId: this.currentMapId,
+            toMapId: this.currentMapId,
+            direction: exit.direction || null,
+            biome: BF.maps[this.currentMapId]?.biome || null,
+            isNew,
+            count: this.completedTransitions
+          }
+        }));
       } catch (error) {
         console.error("Échec du passage de map", error);
         this.pendingGate = null;
+        this.navigationRoute = [];
+        this.returningToBase = false;
         this.callbacks.onStatus(
           "Le passage n’a pas pu être franchi. BlueFox reprend son exploration dans la zone actuelle."
         );
@@ -1147,32 +2225,40 @@
         this.character.enabled = true;
         this.transitioning = false;
         this.transitionStartedAt = 0;
+        if (this.navigationRoute[0] === this.currentMapId) {
+          this.navigationRoute.shift();
+        }
+        if (this.navigationRoute.length) {
+          window.setTimeout(() => this.navigateNextRouteStep(), 2700);
+        } else if (this.persistentNavigationIntent) {
+          window.setTimeout(() => this.resumePersistentNavigation(), 900);
+        } else if (this.returningToBase && this.currentMapId === "crystal") {
+          this.returningToBase = false;
+          window.setTimeout(() => this.moveToBaseCamp(), 450);
+        }
       }
     }
 
+
     updateInteraction(now) {
       if (!this.pendingInteraction || !this.pendingInteraction.userData.active) return;
-      const distance = this.character.root.position.distanceTo(
-        (this.pendingInteraction.userData.worldAnchor || this.pendingInteraction).position
-      );
-      const interactionDistance =
-        (this.pendingInteraction.userData.approachDistance || 1.36) + 0.18;
+      const object = this.pendingInteraction;
+      const profile = object.userData.interactionProfile || this.interactionProfile(object);
+      const anchor = object.userData.worldAnchor || object;
+      const distance = this.character.root.position.distanceTo(anchor.position);
+      const interactionDistance = (object.userData.approachDistance || 1.36) + 0.18;
       if (distance > interactionDistance) {
-        if (
-          !this.interactionStartedAt &&
-          now - this.interactionApproachStartedAt > 6500
-        ) {
+        if (!this.interactionStartedAt && now - this.interactionApproachStartedAt > 6500) {
           this.interactionApproachAttempts += 1;
           if (this.interactionApproachAttempts <= 3) {
-            this.targetInteraction(this.pendingInteraction, true);
+            this.targetInteraction(object, true);
           } else {
-            this.callbacks.onStatus(
-              "BlueFox renonce temporairement à cette ressource inaccessible."
-            );
+            this.callbacks.onStatus(`BlueFox renonce temporairement : ${profile.label} est inaccessible.`);
             this.pendingInteraction = null;
             this.interactionApproachStartedAt = 0;
             this.interactionApproachAttempts = 0;
             this.character.stop();
+            this.missionManager?.cancelCurrentAction("interaction-inaccessible");
           }
         }
         return;
@@ -1180,36 +2266,49 @@
       this.character.stop();
       if (!this.interactionStartedAt) {
         this.interactionStartedAt = now;
-        this.character.facePoint(
-          (this.pendingInteraction.userData.worldAnchor || this.pendingInteraction).position
+        this.character.facePoint(anchor.position);
+        const duration = this.character.playInteraction(
+          profile.action,
+          profile.animationHints
         );
-        const duration = this.character.playInteraction(this.pendingInteraction.userData.kind);
-        this.interactionDuration = duration * 1000;
-        this.callbacks.onAction(
-          this.pendingInteraction.userData.kind === "crystal"
-            ? "BlueFox récolte méthodiquement un cristal."
-            : "BlueFox prélève uniquement les fibres arrivées à maturité."
-        );
+        const fatigueDuration = BF.getSurvivalState?.().fatigue?.actionDuration || 1;
+        this.interactionDuration = Math.max(900, duration * 1000 * fatigueDuration);
+        this.callbacks.onAction(profile.actionText);
         if (this.speechVisible && now - this.lastSpeechAt > 3200) {
-          this.callbacks.onSpeak(
-            this.pendingInteraction.userData.kind === "crystal"
-              ? "Je prélève ce cristal pour l’étape en cours."
-              : "Je récolte uniquement les fibres arrivées à maturité."
-          );
+          this.callbacks.onSpeak(profile.speechText);
           this.lastSpeechAt = now;
         }
         return;
       }
       if (now - this.interactionStartedAt < this.interactionDuration) return;
 
-      const object = this.pendingInteraction;
-      const anchor = object.userData.worldAnchor || object;
       this.character.cancelInteraction();
-      object.userData.active = false;
-      anchor.visible = false;
-      this.callbacks.onCollect(object.userData.kind);
+      object.userData.lastInteractionAt = now;
+      if (profile.removeFromWorld) {
+        object.userData.active = false;
+        anchor.visible = false;
+      }
+      if (profile.collectable) {
+        this.callbacks.onCollect(profile.kind);
+      }
       this.completedInteractions += 1;
-      this.lastCompletedAction = object.userData.kind;
+      this.lastCompletedAction = profile.action;
+      const interactionSource = object.userData.requestedInteractionSource || "autonomy";
+      if (interactionSource === "autonomy") {
+        this.autonomyActionStreak += 1;
+      } else if (interactionSource === "manual") {
+        this.autonomyActionStreak = 0;
+      }
+      const missionAction = this.missionActionForInteraction(profile.action);
+      if (missionAction) {
+        this.missionManager?.notifyActionCompleted(missionAction, {
+          kind: profile.kind,
+          action: profile.action,
+          amount: 1,
+          mapId: this.currentMapId,
+          zoneIndex: this.currentZoneIndex
+        }, { passive: false });
+      }
       this.pendingInteraction = null;
       this.interactionStartedAt = 0;
       this.interactionApproachStartedAt = 0;
@@ -1218,51 +2317,105 @@
       this.postActionRecoveryUntil = now + 650;
       this.lastActivityAt = now;
       this.lastAutonomyAt = now - 5600;
-      const cooldown = setTimeout(() => {
-        if (this.disposed) return;
-        anchor.visible = true;
-        object.userData.active = true;
-        this.resourceCooldowns.delete(object);
-      }, 18000);
-      this.resourceCooldowns.set(object, cooldown);
+      object.userData.requestedMovementMode = null;
+      object.userData.requestedInteractionSource = null;
+      if (profile.removeFromWorld) {
+        if (!Number.isFinite(profile.respawnMs) || profile.respawnMs <= 0) {
+          console.error(
+            `[BlueFox3D] Métadonnée CUO interaction.respawnSeconds absente ou invalide pour ${profile.kind}.`
+          );
+          return;
+        }
+        const respawnMs = profile.respawnMs;
+        const cooldown = setTimeout(() => {
+          if (this.disposed) return;
+          anchor.visible = true;
+          object.userData.active = true;
+          this.resourceCooldowns.delete(object);
+        }, respawnMs);
+        this.resourceCooldowns.set(object, cooldown);
+      }
     }
 
     updateAutonomy(now) {
-      if (this.transitioning || this.pendingInteraction || this.currentRoutine) return;
+      if (
+        this.transitioning ||
+        this.pendingInteraction ||
+        this.pendingGate ||
+        this.pendingZoneExploration ||
+        this.currentRoutine ||
+        this.missionManager?.currentAction
+      ) return;
       if (now < this.postActionRecoveryUntil) return;
-      if (now - this.lastAutonomyAt < 6500) return;
+      if (now - this.lastAutonomyAt < 5000) return;
       if (this.character.root.position.distanceTo(this.character.target) > 0.2) return;
-      this.lastAutonomyAt = now;
 
+      const survival = BF.getSurvivalState?.() || {};
+      const fatigue = survival.fatigue || { level: "normal", movement: 1, actionDuration: 1 };
+      this.character.fatigueSpeedMultiplier = fatigue.movement || 1;
+
+      // Une mission principale active et réalisable conserve toujours la main.
+      // L'autonomie libre n'intervient que si aucune mission prioritaire ne peut agir.
+      if (this.missionManager?.hasRunnablePrimaryMission?.()) return;
+
+      this.lastAutonomyAt = now;
+      if (survival.needs?.criticalRest) {
+        if (this.speechVisible && now - this.lastFatigueSpeechAt > 15000) {
+          this.callbacks.onSpeak("Je suis fatigué, j’ai besoin de récupérer avant de continuer.");
+          this.lastFatigueSpeechAt = now;
+        }
+        this.startRoutine("critical-rest", now, 9000 + Math.random() * 6000, {
+          targetEnergy: 33,
+          pressureReduction: 3
+        });
+        return;
+      }
+
+      if (this.autonomyActionStreak >= this.autonomyBreakTarget) {
+        if (this.speechVisible && Math.random() < 0.45 && now - this.lastFatigueSpeechAt > 12000) {
+          const phrases = [
+            "Je prends un instant pour respirer.",
+            "Une petite pause, puis je reprends.",
+            "Je vais ralentir un peu.",
+            "Je reprends mon souffle."
+          ];
+          this.callbacks.onSpeak(phrases[Math.floor(Math.random() * phrases.length)]);
+          this.lastFatigueSpeechAt = now;
+        }
+        this.startRoutine("micro-rest", now, 2400 + Math.random() * 2200, {
+          restGain: fatigue.level === "heavy" ? 4.2 : 3.2,
+          pressureReduction: 0.75
+        });
+        this.autonomyActionStreak = 0;
+        this.autonomyBreakTarget = 2 + Math.floor(Math.random() * 2);
+        return;
+      }
+
+      if (Math.random() < 0.08) {
+        const duration = this.character.playAmbientObservation();
+        if (duration > 0) {
+          this.lastActivityAt = now;
+          this.callbacks.onStatus("BlueFox s’immobilise un instant et observe les environs.");
+          return;
+        }
+      }
       const routineRoll = Math.random();
-      if (routineRoll < 0.12) {
-        this.startRoutine("rest", now, 7200);
+      if (survival.needs?.rest || routineRoll < 0.12) {
+        this.startRoutine("rest", now, survival.needs?.rest ? 8200 : 7200, {
+          restGain: survival.needs?.rest ? 18 : 12,
+          pressureReduction: 2
+        });
         return;
       }
       if (routineRoll < 0.2) {
         this.startRoutine("research", now, 6500);
         return;
       }
-      if (routineRoll < 0.25) {
+      // La ration est actée dans survival.rationRecipe mais sa consommation
+      // reste désactivée tant que l'inventaire CUO ne fournit pas deux types
+      // de plantes et une vraie ressource ration.
+      if (survival.needs?.food && BF.survival?.rationRecipe?.implemented) {
         this.startRoutine("food", now, 5200);
-        return;
-      }
-
-      const unexploredZones = this.currentMap.zoneRegions.filter(
-        (zone) => !this.discoveredZones.has(`${this.currentMapId}:${zone.index}`)
-      );
-      if (unexploredZones.length && Math.random() < 0.58) {
-        unexploredZones.sort((left, right) =>
-          this.character.root.position.distanceTo(left.center) -
-          this.character.root.position.distanceTo(right.center)
-        );
-        const zone = unexploredZones[0];
-        this.pendingZoneExploration = zone;
-        this.character.setTarget(zone.center);
-        this.showWorldMarker(zone.center);
-        this.callbacks.onStatus(
-          `BlueFox choisit d’explorer ${zone.name} avant de poursuivre les collectes.`
-        );
         return;
       }
 
@@ -1278,11 +2431,10 @@
         return;
       }
 
-      const resources = this.currentMap.interactables.filter(
-        (object) => object.userData.active
-      );
+      const resources = this.currentMap.interactables.filter((object) => this.canInteractWith(object, now));
       if (resources.length) {
         const object = resources[Math.floor(Math.random() * resources.length)];
+        object.userData.requestedInteractionSource = "autonomy";
         this.targetInteraction(object);
         return;
       }
@@ -1307,14 +2459,17 @@
       this.callbacks.onStatus("BlueFox poursuit une exploration locale autonome.");
     }
 
-    startRoutine(type, now, duration) {
+    startRoutine(type, now, duration, detail = {}) {
       this.character.stop();
       if (this.destinationMarker) this.destinationMarker.visible = false;
       if (this.pathLine) this.pathLine.visible = false;
-      this.currentRoutine = { type, startedAt: now, endsAt: now + duration };
-      this.character.playRoutine(type, duration / 1000);
+      this.currentRoutine = { type, startedAt: now, endsAt: now + duration, detail: { ...detail } };
+      const animationType = type === "micro-rest" || type === "critical-rest" ? "rest" : type;
+      this.character.playRoutine(animationType, duration / 1000);
       const messages = {
         rest: "BlueFox se repose quelques instants pour préserver ses forces.",
+        "micro-rest": "BlueFox marque une courte pause pour reprendre son souffle.",
+        "critical-rest": "BlueFox interrompt ses activités pour récupérer d’une fatigue critique.",
         research: "BlueFox analyse ses observations avant de poursuivre l’exploration.",
         food: "BlueFox prend une ration et vérifie ses réserves."
       };
@@ -1323,15 +2478,54 @@
 
     updateRoutine(now) {
       if (!this.currentRoutine || now < this.currentRoutine.endsAt) return;
-      const finished = this.currentRoutine.type;
+      const finishedRoutine = this.currentRoutine;
+      const finished = finishedRoutine.type;
       this.currentRoutine = null;
       this.character.cancelInteraction();
-      if (finished === "rest") this.callbacks.onRest();
+      if (["rest", "micro-rest", "critical-rest"].includes(finished)) this.callbacks.onRest();
+      BF.survival?.completeRoutine?.(finished, finishedRoutine.detail || {});
+      const missionActionTypes = {
+        rest: BF.Missions?.ActionType.REST,
+        "micro-rest": null,
+        "critical-rest": BF.Missions?.ActionType.REST,
+        research: BF.Missions?.ActionType.RESEARCH,
+        food: BF.Missions?.ActionType.EAT
+      };
+      const expectedMissionType = this.missionManager?.currentAction?.type;
+      const completedMissionType =
+        finished === "research" &&
+        expectedMissionType === BF.Missions?.ActionType.OBSERVE
+          ? BF.Missions.ActionType.OBSERVE
+          : missionActionTypes[finished];
+      if (completedMissionType) {
+        this.missionManager?.notifyActionCompleted(
+          completedMissionType,
+          { routine: finished, amount: 1 }
+        );
+      }
       this.lastAutonomyAt = now - 5000;
       this.lastActivityAt = now;
     }
 
     ensureActivity(now) {
+      if (this.missionManager?.hasRunnablePrimaryMission?.()) return;
+      if (this.pendingGate) {
+        if (this.character.speed > 0.08) {
+          this.lastActivityAt = now;
+          return;
+        }
+        if (now - this.lastActivityAt >= 6000) {
+          this.character.setTarget(this.pendingGate.position, "run");
+          this.showWorldMarker(this.pendingGate.position);
+          this.callbacks.onStatus(
+            this.discoveredMaps.has(this.pendingGate.userData.exit.targetMap)
+              ? "BlueFox reprend le trajet mémorisé sans se laisser détourner."
+              : "BlueFox reprend sa route vers la terre inconnue sans interrompre l’exploration."
+          );
+          this.lastActivityAt = now;
+        }
+        return;
+      }
       const activeMotion = this.character.speed > 0.08 ||
         Boolean(this.interactionStartedAt) ||
         Boolean(this.pendingZoneExploration) ||
@@ -1341,15 +2535,14 @@
         this.lastActivityAt = now;
         return;
       }
-      if (now - this.lastActivityAt < 26000) return;
+      if (now - this.lastActivityAt < 12000) return;
 
       this.pendingInteraction = null;
       this.character.cancelInteraction();
-      const resources = this.currentMap.interactables.filter(
-        (object) => object.userData.active
-      );
+      const resources = this.currentMap.interactables.filter((object) => this.canInteractWith(object, now));
       if (resources.length) {
         const object = resources[Math.floor(Math.random() * resources.length)];
+        object.userData.requestedInteractionSource = "autonomy";
         this.targetInteraction(object);
         this.callbacks.onAction(
           "BlueFox reprend spontanément son activité après avoir évalué les priorités locales."
@@ -1390,8 +2583,16 @@
 
     currentActivity() {
       if (this.currentRoutine) {
-        if (this.currentRoutine.type === "rest") {
-          return { key: "rest", label: "Repos et récupération des forces.", speech: "Je fais une courte pause avant de reprendre." };
+        if (["rest", "micro-rest", "critical-rest"].includes(this.currentRoutine.type)) {
+          return {
+            key: this.currentRoutine.type,
+            label: this.currentRoutine.type === "critical-rest"
+              ? "Repos prolongé après une fatigue critique."
+              : "Repos et récupération des forces.",
+            speech: this.currentRoutine.type === "critical-rest"
+              ? "Je dois récupérer avant de continuer."
+              : "Je fais une courte pause avant de reprendre."
+          };
         }
         if (this.currentRoutine.type === "research") {
           return { key: "research", label: "Recherche et analyse des observations récentes.", speech: "Je compare mes observations pour préparer la suite." };
@@ -1399,22 +2600,34 @@
         return { key: "food", label: "Alimentation et vérification des réserves.", speech: "Je prends une ration avant de poursuivre." };
       }
       if (this.pendingInteraction) {
-        const kind = this.pendingInteraction.userData.kind;
-        if (kind === "crystal") {
-          return this.interactionStartedAt
-            ? { key: "collect-crystal", label: "Collecte de cristaux énergétiques.", speech: "Je prélève ce cristal, juste la quantité nécessaire." }
-            : { key: "approach-crystal", label: "Déplacement vers un gisement de cristaux.", speech: "Je rejoins le cristal que j’ai repéré." };
-        }
-        return this.interactionStartedAt
-          ? { key: "collect-fiber", label: "Collecte de fibres arrivées à maturité.", speech: "Je récolte uniquement les fibres mûres." }
-          : { key: "approach-fiber", label: "Déplacement vers une plante à fibres.", speech: "Je vais prélever quelques fibres utiles." };
+        const profile =
+          this.pendingInteraction.userData.interactionProfile ||
+          this.interactionProfile(this.pendingInteraction);
+        const phase = this.interactionStartedAt ? "action" : "approach";
+        return {
+          key: `${phase}-${profile.action}-${profile.kind}`,
+          label: this.interactionStartedAt
+            ? profile.actionText
+            : profile.approachText,
+          speech: profile.speechText
+        };
       }
       if (this.transitioning) {
         return { key: "map-transition", label: "Passage vers une nouvelle zone cartographiée.", speech: "Je franchis le passage vers la zone suivante." };
       }
       if (this.pendingGate) {
-        const destination = BF.maps[this.pendingGate.userData.exit.targetMap]?.name;
-        return { key: `gate-${destination}`, label: `Déplacement vers le passage menant à ${destination}.`, speech: `Je me dirige vers ${destination}.` };
+        const targetMapId = this.pendingGate.userData.exit.targetMap;
+        const isKnown = this.discoveredMaps.has(targetMapId);
+        const destination = isKnown ? BF.maps[targetMapId]?.name : "une terre inconnue";
+        return {
+          key: `gate-${isKnown ? targetMapId : "unknown"}`,
+          label: isKnown
+            ? `Déplacement vers le passage menant à ${destination}.`
+            : "Déplacement vers un passage encore inconnu.",
+          speech: isKnown
+            ? `Je me dirige vers ${destination}.`
+            : "Je me dirige vers une terre inconnue."
+        };
       }
       if (this.pendingZoneExploration) {
         return {
@@ -1526,12 +2739,16 @@
           "Le passage a été interrompu proprement. BlueFox reprend son activité."
         );
       }
+      const fatigue = BF.getSurvivalState?.().fatigue;
+      this.character.fatigueSpeedMultiplier = fatigue?.movement || 1;
       this.character.update(dt);
       this.currentMap.update?.(this.clock.elapsedTime);
       this.updateBiomeParticles(dt, this.clock.elapsedTime);
       this.updatePerformanceGovernor(dt);
       this.updateRoutine(now);
       this.updateInteraction(now);
+      this.missionManager?.update(now);
+      BF.bibleRuntime?.updateCompletionGates?.(now);
       this.updateAutonomy(now);
       this.ensureActivity(now);
       this.updateInformationLayers(now);
@@ -1562,8 +2779,20 @@
         );
         this.panorama.rotation.y = BF.dampAngle(
           this.panorama.rotation.y,
-          cameraAngle * 0.085,
-          1.4,
+          cameraAngle,
+          3.2,
+          dt
+        );
+        this.panorama.position.x = BF.damp(
+          this.panorama.position.x,
+          this.controls.target.x,
+          1.35,
+          dt
+        );
+        this.panorama.position.z = BF.damp(
+          this.panorama.position.z,
+          this.controls.target.z,
+          1.35,
           dt
         );
       }
@@ -1571,7 +2800,7 @@
       this.ensureCompassNeedle();
       if (this.compassNeedle) {
         this.compassNeedle.style.transform =
-          `translate(-50%, -100%) rotate(${this.character.heading + Math.PI}rad)`;
+          `translate(-50%, -100%) rotate(${Math.PI - this.character.heading}rad)`;
       }
       this.updateSpeechBubble();
       if (now - this.lastSavedAt > 3000) {
@@ -1591,13 +2820,15 @@
 
     getDiagnostics() {
       return {
-        version: "0.16.12",
+        version: "0.16.20",
         map: this.currentMapId,
         biomeProfile: this.currentAtmosphereProfile,
         biomeParticles: this.biomeParticleSettings?.count || 0,
         performanceQuality: this.performanceQuality,
         measuredFps: this.measuredFps,
         missingImages: [...this.missingImageUrls],
+        panoramaAsset: this.currentPanoramaAsset,
+        generatedTopology: this.generatedTopology.length,
         transitioning: this.transitioning,
         transitionsCompleted: this.completedTransitions,
         interactionsCompleted: this.completedInteractions,
@@ -1605,6 +2836,7 @@
         cameraRecoveries: this.cameraController?.recoveryCount || 0,
         browserResumes: this.resumeCount,
         zonesDiscovered: this.discoveredZones.size,
+        mission: this.missionManager?.getState() || null,
         lastResumeAt: this.lastResumeAt,
         characterActive: Boolean(
           this.character?.speed > 0.08 ||
@@ -1629,18 +2861,22 @@
       this.resizeObserver?.disconnect();
       this.renderer.domElement.removeEventListener("pointerdown", this.onPointerDown);
       this.renderer.domElement.removeEventListener("pointerup", this.onPointerUp);
+      this.renderer.domElement.removeEventListener("dblclick", this.onWorldDoubleClick);
       global.removeEventListener("bluefox:navigate", this.onNavigate);
+      global.removeEventListener("bluefox:return-base", this.onReturnBase);
       global.removeEventListener("bluefox:path-planned", this.onPathPlanned);
       global.removeEventListener("bluefox:navigation-failed", this.onNavigationFailed);
       global.removeEventListener("bluefox:image-missing", this.onMissingImage);
       document.removeEventListener("visibilitychange", this.onVisibilityChange);
       global.removeEventListener("bluefox:camera-mode", this.onCameraMode);
       window.clearTimeout(this.cameraClickTimer);
+      window.clearTimeout(this.pointerClickTimer);
       this.cameraButton?.removeEventListener("click", this.onCameraClick);
       this.cameraButton?.removeEventListener("dblclick", this.onCameraDoubleClick);
       this.speechButton?.removeEventListener("click", this.onSpeechToggle);
       this.cameraButton?.remove();
       this.speechButton?.remove();
+      this.missionManager?.dispose();
       document.body.classList.remove("bluefox-speech-hidden");
       this.clickMarker?.remove();
       this.cameraController?.dispose();
@@ -1655,6 +2891,15 @@
       if (BF.currentEngine === this) {
         BF.currentEngine = null;
         BF.getDiagnostics = null;
+        BF.getMissionState = null;
+        BF.startMission = null;
+        BF.setPrimaryMission = null;
+        BF.suggestMissionPriority = null;
+        BF.pauseMission = null;
+        BF.resumeMission = null;
+        BF.failMission = null;
+        BF.triggerMission = null;
+        BF.setSiteStage = null;
       }
       this.container.replaceChildren();
     }

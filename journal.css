@@ -31,6 +31,29 @@
   transform: scale(1.04);
 }
 
+.journal-window-biome-live {
+  filter: saturate(.92) contrast(1.04) brightness(.82);
+  animation: journal-biome-perspective 18s ease-in-out infinite alternate;
+  will-change: transform, background-position;
+}
+
+@keyframes journal-biome-perspective {
+  from {
+    background-position: 47% 50%;
+    transform: scale(1.05) translate3d(-.5%, 0, 0);
+  }
+  to {
+    background-position: 53% 48%;
+    transform: scale(1.09) translate3d(.5%, -.4%, 0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .journal-window-biome-live {
+    animation: none;
+  }
+}
+
 .journal-capsule {
   z-index: 1;
   display: block;
