@@ -78,6 +78,33 @@
       this.navigationRoute = [];
       this.persistentNavigationIntent = null;
       this.returningToBase = false;
+
+      // WorldEngine reste le propriétaire unique de l'exécution du monde :
+      // OFF, pause d'intro et fenêtres de grâce agissent ici, avant BAC/Missions.
+      this.runtimePaused = false;
+      this.runtimePauseReason = "";
+      this.autonomyMode = this.readAutonomyMode();
+      this.autonomyGraceUntil = 0;
+      this.speechQuietUntil = 0;
+      this.startupQuietUntil = 0;
+      this.semiAutonomousGateLock = false;
+      this.onAutonomyMode = (event) => this.applyAutonomyMode(
+        event?.detail?.mode,
+        event?.detail?.source || "event"
+      );
+
+      const freshNewGameAt = Number(
+        localStorage.getItem("bluefox_new_game_start_v1") || 0
+      );
+      this.freshNewGameStartup =
+        freshNewGameAt > 0 && Date.now() - freshNewGameAt < 120000;
+      if (this.freshNewGameStartup) {
+        const quietUntil = performance.now() + this.autonomyQuietDelayMs();
+        this.autonomyGraceUntil = quietUntil;
+        this.speechQuietUntil = quietUntil;
+        this.startupQuietUntil = quietUntil;
+      }
+
       this.onMissingImage = (event) => {
         const source = String(event.detail?.source || "image inconnue");
         if (this.missingImageUrls.has(source)) return;
@@ -95,6 +122,134 @@
           `Asset manquant pour ${event.detail?.mapName || "la map actuelle"} : ${filename}.`
         );
       };
+    }
+
+    autonomyQuietDelayMs() {
+      return 2000 + Math.floor(Math.random() * 2001);
+    }
+
+    readAutonomyMode() {
+      const apiMode = String(BF.getAutonomyMode?.() || "").toLowerCase();
+      if (["off", "semi", "full"].includes(apiMode)) return apiMode;
+
+      const stored = String(
+        localStorage.getItem("bluefox_autonomy_mode_v1") || ""
+      ).toLowerCase();
+      if (["off", "semi", "full"].includes(stored)) return stored;
+
+      const startedAt = Number(
+        localStorage.getItem("bluefox_new_game_start_v1") || 0
+      );
+      if (startedAt > 0 && Date.now() - startedAt < 120000) return "off";
+      return startedAt > 0 ? "full" : "off";
+    }
+
+    beginAutonomyGrace(reason = "runtime", now = performance.now()) {
+      const until = now + this.autonomyQuietDelayMs();
+      this.autonomyGraceUntil = Math.max(this.autonomyGraceUntil, until);
+      this.speechQuietUntil = Math.max(this.speechQuietUntil, until);
+      this.lastAutonomyAt = now;
+      this.lastActivityAt = now;
+      this.lastAutonomyGraceReason = reason;
+      return Math.max(0, until - now);
+    }
+
+    cancelAutonomousActivity(reason = "autonomy-disabled") {
+      const playerNavigation = Boolean(
+        this.persistentNavigationIntent ||
+        this.returningToBase ||
+        this.navigationRoute.length
+      );
+      const manualInteraction =
+        this.pendingInteraction?.userData?.requestedInteractionSource === "manual";
+
+      this.missionManager?.cancelCurrentAction?.(reason);
+
+      if (this.pendingInteraction && !manualInteraction) {
+        this.pendingInteraction.userData.requestedInteractionSource = null;
+        this.pendingInteraction.userData.requestedMovementMode = null;
+        this.pendingInteraction = null;
+        this.interactionStartedAt = 0;
+        this.interactionApproachStartedAt = 0;
+        this.interactionApproachAttempts = 0;
+        this.character?.cancelInteraction?.();
+      }
+
+      if (!playerNavigation) {
+        this.pendingGate = null;
+        this.pendingZoneExploration = null;
+      }
+
+      if (this.currentRoutine) {
+        this.currentRoutine = null;
+        this.character?.cancelInteraction?.();
+      }
+
+      if (!playerNavigation && !manualInteraction && this.character?.root) {
+        this.character.stop?.();
+        this.character.setTarget?.(this.character.root.position);
+        if (this.destinationMarker) this.destinationMarker.visible = false;
+        if (this.pathLine) this.pathLine.visible = false;
+      }
+
+      const now = performance.now();
+      this.lastAutonomyAt = now;
+      this.lastActivityAt = now;
+    }
+
+    applyAutonomyMode(mode, source = "system", now = performance.now()) {
+      const normalized = String(mode || this.readAutonomyMode()).toLowerCase();
+      if (!["off", "semi", "full"].includes(normalized)) return false;
+
+      const previous = this.autonomyMode;
+      this.autonomyMode = normalized;
+
+      if (normalized === "off") {
+        this.cancelAutonomousActivity("autonomy-mode-off");
+        return true;
+      }
+
+      if (normalized !== previous) {
+        this.beginAutonomyGrace(`autonomy-${source}`, now);
+      }
+      if (normalized !== "semi") this.semiAutonomousGateLock = false;
+      return true;
+    }
+
+    autonomyAllowed(now = performance.now()) {
+      const storedMode = this.readAutonomyMode();
+      if (storedMode !== this.autonomyMode) {
+        this.applyAutonomyMode(storedMode, "storage-sync", now);
+      }
+      return Boolean(
+        !this.runtimePaused &&
+        this.autonomyMode !== "off" &&
+        now >= this.autonomyGraceUntil &&
+        now >= this.startupQuietUntil
+      );
+    }
+
+    setRuntimePaused(paused, reason = "runtime") {
+      const next = paused === true;
+      if (this.runtimePaused === next) return true;
+      this.runtimePaused = next;
+      this.runtimePauseReason = next ? reason : "";
+      this.clock?.getDelta?.();
+      if (!next) this.beginAutonomyGrace(`resume-${reason}`);
+      return true;
+    }
+
+    canStartAutonomousGate() {
+      return !(
+        this.autonomyMode === "semi" &&
+        this.semiAutonomousGateLock
+      );
+    }
+
+    noteLocalAutonomousDecision() {
+      if (this.autonomyMode === "semi" && this.semiAutonomousGateLock) {
+        this.semiAutonomousGateLock = false;
+      }
     }
 
     async initialize() {
@@ -220,6 +375,16 @@
             stage,
             detail
           ) || false;
+        BF.bibleRuntime?.activateInitialMissions?.();
+      }
+      if (this.freshNewGameStartup) {
+        const now = performance.now();
+        const quietUntil = now + this.autonomyQuietDelayMs();
+        this.autonomyGraceUntil = Math.max(this.autonomyGraceUntil, quietUntil);
+        this.speechQuietUntil = Math.max(this.speechQuietUntil, quietUntil);
+        this.startupQuietUntil = Math.max(this.startupQuietUntil, quietUntil);
+        this.lastAutonomyAt = now;
+        this.lastActivityAt = now;
       }
       this.loop();
       return this;
@@ -954,30 +1119,14 @@
     createExplorationHud() {
       this.ensureCompassNeedle(true);
 
-      this.cameraButton = document.createElement("button");
-      this.cameraButton.type = "button";
-      this.cameraButton.className = "bluefox-camera-button";
-      this.cameraButton.setAttribute("aria-label", "Recentrer la caméra sur BlueFox");
-      this.cameraButton.title = "Clic : recentrer · double-clic : suivi libre";
-      this.cameraButton.innerHTML = "<span>◎</span>";
-      document.body.appendChild(this.cameraButton);
-
-      this.speechButton = document.createElement("button");
-      this.speechButton.type = "button";
-      this.speechButton.className = "bluefox-speech-button";
-      this.speechButton.setAttribute("aria-label", "Afficher ou masquer les paroles de BlueFox");
-      this.speechButton.title = "Afficher ou masquer les paroles de BlueFox";
-      this.speechButton.innerHTML = "<span>💬</span>";
-      document.body.appendChild(this.speechButton);
-
-      this.onCameraClick = () => {
+      this.onCameraClick = this.onCameraClick || (() => {
         window.clearTimeout(this.cameraClickTimer);
         this.cameraClickTimer = window.setTimeout(() => {
           this.cameraController.resetBehindCharacter(false);
           this.callbacks.onStatus("Caméra recentrée derrière BlueFox.");
         }, 240);
-      };
-      this.onCameraDoubleClick = (event) => {
+      });
+      this.onCameraDoubleClick = this.onCameraDoubleClick || ((event) => {
         event.preventDefault();
         window.clearTimeout(this.cameraClickTimer);
         const mode = this.cameraController.toggleFreeFollow();
@@ -987,22 +1136,84 @@
             ? "Caméra libre : elle conserve son point de vue tout en suivant BlueFox."
             : "Caméra ancrée : recentrage automatique après 3,5 secondes."
         );
-      };
-      this.onCameraMode = (event) => this.updateCameraButton(event.detail.mode);
-      this.cameraButton.addEventListener("click", this.onCameraClick);
-      this.cameraButton.addEventListener("dblclick", this.onCameraDoubleClick);
-      this.onSpeechToggle = () => {
+      });
+      this.onCameraMode = this.onCameraMode || ((event) =>
+        this.updateCameraButton(event.detail.mode)
+      );
+      this.onSpeechToggle = this.onSpeechToggle || (() => {
         this.speechVisible = !this.speechVisible;
         localStorage.setItem(
           "bluefox_speech_visible_v1",
           String(this.speechVisible)
         );
         this.updateSpeechButton();
-      };
-      this.speechButton.addEventListener("click", this.onSpeechToggle);
-      global.addEventListener("bluefox:camera-mode", this.onCameraMode);
+      });
+
+      this.ensureHudControl("camera");
+      this.ensureHudControl("speech");
+
+      if (!this.cameraModeListenerBound) {
+        global.addEventListener("bluefox:camera-mode", this.onCameraMode);
+        this.cameraModeListenerBound = true;
+      }
       this.updateCameraButton(this.cameraController.mode);
       this.updateSpeechButton();
+    }
+
+    ensureHudControl(control) {
+      const definitions = {
+        camera: {
+          property: "cameraButton",
+          className: "bluefox-camera-button",
+          ariaLabel: "Recentrer la caméra sur BlueFox",
+          title: "Clic : recentrer · double-clic : suivi libre",
+          content: "<span>◎</span>",
+          listeners: [
+            ["click", this.onCameraClick],
+            ["dblclick", this.onCameraDoubleClick]
+          ]
+        },
+        speech: {
+          property: "speechButton",
+          className: "bluefox-speech-button",
+          ariaLabel: "Afficher ou masquer les paroles de BlueFox",
+          title: "Afficher ou masquer les paroles de BlueFox",
+          content: "<span>💬</span>",
+          listeners: [["click", this.onSpeechToggle]]
+        }
+      };
+      const definition = definitions[control];
+      if (!definition) return null;
+
+      let node = this[definition.property];
+      if (!node || !node.isConnected) {
+        const existing = document.querySelector(`.${definition.className}`);
+        node = existing || document.createElement("button");
+        node.type = "button";
+        node.classList.add(definition.className);
+        node.setAttribute("aria-label", definition.ariaLabel);
+        node.title = definition.title;
+        if (!node.querySelector("span")) node.innerHTML = definition.content;
+        if (!node.isConnected) document.body.appendChild(node);
+        this[definition.property] = node;
+      }
+
+      definition.listeners.forEach(([type, listener]) => {
+        if (!listener) return;
+        const key = `bluefox${type}Bound`;
+        if (node.dataset[key] === "1") return;
+        node.addEventListener(type, listener);
+        node.dataset[key] = "1";
+      });
+      return node;
+    }
+
+    setHudHighlight(control, enabled = true) {
+      const node = this.ensureHudControl(control);
+      if (!node) return false;
+      node.classList.toggle("bluefox-ui-highlight", enabled === true);
+      node.setAttribute("data-bluefox-highlight", enabled === true ? "true" : "false");
+      return true;
     }
 
     ensureCompassNeedle(force = false) {
@@ -1022,11 +1233,13 @@
     }
 
     updateCameraButton(mode) {
-      if (!this.cameraButton) return;
+      const button = this.ensureHudControl("camera");
+      if (!button) return;
       const free = mode === "free-follow";
-      this.cameraButton.classList.toggle("free", free);
-      this.cameraButton.setAttribute("aria-pressed", free ? "true" : "false");
-      this.cameraButton.querySelector("span").textContent = free ? "⊘" : "◎";
+      button.classList.toggle("free", free);
+      button.setAttribute("aria-pressed", free ? "true" : "false");
+      const icon = button.querySelector("span");
+      if (icon) icon.textContent = free ? "⊘" : "◎";
     }
 
     updateSpeechButton() {
@@ -1034,8 +1247,9 @@
         "bluefox-speech-hidden",
         !this.speechVisible
       );
-      this.speechButton?.classList.toggle("disabled", !this.speechVisible);
-      this.speechButton?.setAttribute(
+      const button = this.ensureHudControl("speech");
+      button?.classList.toggle("disabled", !this.speechVisible);
+      button?.setAttribute(
         "aria-pressed",
         this.speechVisible ? "true" : "false"
       );
@@ -1197,6 +1411,8 @@
           this.character.root.position
         );
         this.cameraController.ensureHealthy(now);
+        this.ensureHudControl("camera");
+        this.ensureHudControl("speech");
         this.lastActivityAt = now;
         this.lastAutonomyAt = Math.min(this.lastAutonomyAt, now - 4800);
         this.resize();
@@ -1208,6 +1424,7 @@
       global.addEventListener("bluefox:return-base", this.onReturnBase);
       global.addEventListener("bluefox:path-planned", this.onPathPlanned);
       global.addEventListener("bluefox:navigation-failed", this.onNavigationFailed);
+      global.addEventListener("bluefox:autonomy-mode", this.onAutonomyMode);
       document.addEventListener("visibilitychange", this.onVisibilityChange);
     }
 
@@ -1246,7 +1463,8 @@
     }
 
     handlePointer(event, movementMode = "run") {
-      if (this.transitioning) return;
+      if (this.transitioning || performance.now() < this.startupQuietUntil) return;
+      this.noteLocalAutonomousDecision();
       this.navigationRoute = [];
       this.showClickMarker(event);
       const rect = this.renderer.domElement.getBoundingClientRect();
@@ -1263,6 +1481,12 @@
       if (hits.length) {
         const object = hits[0].object;
         if (object.userData.active) {
+          if (
+            this.pendingInteraction === object &&
+            (this.interactionStartedAt || this.interactionApproachStartedAt)
+          ) {
+            return;
+          }
           object.userData.requestedMovementMode = movementMode;
           object.userData.requestedInteractionSource = "manual";
           this.targetInteraction(object);
@@ -1707,6 +1931,9 @@
     }
 
     targetInteraction(object, retry = false) {
+      if (!retry && object?.userData?.requestedInteractionSource !== "manual") {
+        this.noteLocalAutonomousDecision();
+      }
       this.pendingZoneExploration = null;
       const approach = this.interactionApproachPoint(
         object,
@@ -1761,6 +1988,41 @@
         });
         map.group.add(capsule);
         map.crashCapsule = capsule;
+
+        const capsuleDefinition = BF.ObjectLibrary?.get?.("crash_capsule");
+        const capsuleProxy = capsuleDefinition
+          ? BF.ObjectLibrary?.create?.(
+              this.THREE,
+              "crash_capsule",
+              definition.palette,
+              0
+            )
+          : null;
+        const capsuleHitbox = capsuleProxy?.hitbox || null;
+        if (capsuleDefinition && capsuleHitbox) {
+          const instanceId = `${capsuleDefinition.id}:${definition.id}`;
+          const metadata = {
+            instanceId,
+            variant: 0,
+            catalogId: capsuleDefinition.id,
+            libraryType: capsuleDefinition.type,
+            functional: capsuleDefinition
+          };
+
+          capsuleHitbox.removeFromParent();
+          capsule.add(capsuleHitbox);
+          Object.assign(capsule.userData, metadata, {
+            objectType: capsuleDefinition.type,
+            spawnSource: "crash-site",
+            specialRuntimeRoot: true
+          });
+          Object.assign(capsuleHitbox.userData, metadata, {
+            worldAnchor: capsule,
+            interactionRadius: 1.85 * scale
+          });
+          map.interactables.push(capsuleHitbox);
+          map.crashCapsuleHitbox = capsuleHitbox;
+        }
 
         const colliderOffsets = [-2.35, 0, 2.35];
         colliderOffsets.forEach((offsetX) => {
@@ -2080,10 +2342,12 @@
         this.saveZoneDiscovery();
         const mapIsKnown = this.discoveredMaps.has(this.currentMapId) ||
           this.currentMapId === "crystal";
-        this.callbacks.onAction(mapIsKnown
-          ? `Nouvelle zone explorée : ${this.currentMap.definition.name}.`
-          : "BlueFox prend pied sur une terre inconnue."
-        );
+        if (now >= this.startupQuietUntil) {
+          this.callbacks.onAction(mapIsKnown
+            ? `Nouvelle zone explorée : ${this.currentMap.definition.name}.`
+            : "BlueFox prend pied sur une terre inconnue."
+          );
+        }
       }
       if (reachedPlannedZone) {
         const preciseZoneKey = `${this.currentMapId}:${nearest.index}`;
@@ -2146,6 +2410,29 @@
       if (this.transitioning) return;
       const exit = gate.userData.exit;
       const previousMapId = this.currentMapId;
+      const playerDirectedTransition = Boolean(
+        this.persistentNavigationIntent ||
+        this.returningToBase ||
+        this.navigationRoute.length
+      );
+
+      if (
+        !playerDirectedTransition &&
+        this.autonomyMode === "semi" &&
+        !this.canStartAutonomousGate()
+      ) {
+        this.pendingGate = null;
+        this.character.stop();
+        this.character.setTarget(this.character.root.position);
+        if (this.destinationMarker) this.destinationMarker.visible = false;
+        if (this.pathLine) this.pathLine.visible = false;
+        this.lastAutonomyAt = performance.now();
+        this.lastActivityAt = performance.now();
+        this.callbacks.onStatus(
+          "BlueFox reste dans cette zone et réévalue d’abord son environnement."
+        );
+        return;
+      }
       if (!this.canDiscoverMap(exit.targetMap)) {
         this.pendingGate = null;
         this.character.stop();
@@ -2191,6 +2478,12 @@
         this.gateCooldownUntil = performance.now() + 2600;
         this.lastActivityAt = performance.now();
         this.lastAutonomyAt = performance.now() - 4200;
+        if (!playerDirectedTransition) {
+          if (this.autonomyMode === "semi") {
+            this.semiAutonomousGateLock = true;
+          }
+          this.beginAutonomyGrace("autonomous-map-transition");
+        }
         this.savePosition();
 
         await new Promise((resolve) => setTimeout(resolve, 220));
@@ -2338,6 +2631,7 @@
     }
 
     updateAutonomy(now) {
+      if (!this.autonomyAllowed(now)) return;
       if (
         this.transitioning ||
         this.pendingInteraction ||
@@ -2394,6 +2688,7 @@
       if (Math.random() < 0.08) {
         const duration = this.character.playAmbientObservation();
         if (duration > 0) {
+          this.noteLocalAutonomousDecision();
           this.lastActivityAt = now;
           this.callbacks.onStatus("BlueFox s’immobilise un instant et observe les environs.");
           return;
@@ -2422,7 +2717,11 @@
       const knownGate = this.currentMap.gates.find(
         (gate) => this.discoveredMaps.has(gate.userData.exit.targetMap)
       );
-      if (knownGate && Math.random() < 0.12) {
+      if (
+        knownGate &&
+        this.canStartAutonomousGate() &&
+        Math.random() < 0.12
+      ) {
         this.pendingGate = knownGate;
         this.character.setTarget(knownGate.position);
         this.callbacks.onStatus(
@@ -2454,12 +2753,14 @@
           25
         )
       );
+      this.noteLocalAutonomousDecision();
       this.character.setTarget(patrolTarget);
       this.showWorldMarker(patrolTarget);
       this.callbacks.onStatus("BlueFox poursuit une exploration locale autonome.");
     }
 
     startRoutine(type, now, duration, detail = {}) {
+      this.noteLocalAutonomousDecision();
       this.character.stop();
       if (this.destinationMarker) this.destinationMarker.visible = false;
       if (this.pathLine) this.pathLine.visible = false;
@@ -2508,6 +2809,7 @@
     }
 
     ensureActivity(now) {
+      if (!this.autonomyAllowed(now)) return;
       if (this.missionManager?.hasRunnablePrimaryMission?.()) return;
       if (this.pendingGate) {
         if (this.character.speed > 0.08) {
@@ -2555,6 +2857,7 @@
           0,
           BF.clamp(Math.sin(angle) * distance, -25, 25)
         );
+        this.noteLocalAutonomousDecision();
         this.character.setTarget(target);
         this.showWorldMarker(target);
         this.callbacks.onStatus("BlueFox reprend une patrouille d’observation autonome.");
@@ -2683,6 +2986,7 @@
       if (
         this.speechVisible &&
         stateChanged &&
+        now >= this.speechQuietUntil &&
         now - this.lastSpeechAt > 6500
       ) {
         this.callbacks.onSpeak(activity.speech);
@@ -2747,10 +3051,21 @@
       this.updatePerformanceGovernor(dt);
       this.updateRoutine(now);
       this.updateInteraction(now);
-      this.missionManager?.update(now);
+      if (
+        this.semiAutonomousGateLock &&
+        this.pendingZoneExploration
+      ) {
+        this.noteLocalAutonomousDecision();
+      }
+      const autonomousRuntimeAllowed = this.autonomyAllowed(now);
+      if (autonomousRuntimeAllowed) {
+        this.missionManager?.update(now);
+      }
       BF.bibleRuntime?.updateCompletionGates?.(now);
-      this.updateAutonomy(now);
-      this.ensureActivity(now);
+      if (autonomousRuntimeAllowed) {
+        this.updateAutonomy(now);
+        this.ensureActivity(now);
+      }
       this.updateInformationLayers(now);
       this.updateCurrentZone(now);
       this.updateDestinationMarker(now);
@@ -2812,6 +3127,10 @@
     loop() {
       if (this.disposed) return;
       this.frame = requestAnimationFrame(() => this.loop());
+      if (this.runtimePaused) {
+        this.clock?.getDelta?.();
+        return;
+      }
       const dt = Math.min(this.clock.getDelta(), 0.04);
       const now = performance.now();
       this.update(dt, now);
@@ -2835,6 +3154,18 @@
         navigationFailures: this.navigationFailures,
         cameraRecoveries: this.cameraController?.recoveryCount || 0,
         browserResumes: this.resumeCount,
+        runtimePaused: this.runtimePaused,
+        runtimePauseReason: this.runtimePauseReason,
+        autonomyMode: this.autonomyMode,
+        autonomyGraceRemainingMs: Math.max(
+          0,
+          Math.round(this.autonomyGraceUntil - performance.now())
+        ),
+        startupQuietRemainingMs: Math.max(
+          0,
+          Math.round(this.startupQuietUntil - performance.now())
+        ),
+        semiAutonomousGateLock: this.semiAutonomousGateLock,
         zonesDiscovered: this.discoveredZones.size,
         mission: this.missionManager?.getState() || null,
         lastResumeAt: this.lastResumeAt,
@@ -2866,6 +3197,7 @@
       global.removeEventListener("bluefox:return-base", this.onReturnBase);
       global.removeEventListener("bluefox:path-planned", this.onPathPlanned);
       global.removeEventListener("bluefox:navigation-failed", this.onNavigationFailed);
+      global.removeEventListener("bluefox:autonomy-mode", this.onAutonomyMode);
       global.removeEventListener("bluefox:image-missing", this.onMissingImage);
       document.removeEventListener("visibilitychange", this.onVisibilityChange);
       global.removeEventListener("bluefox:camera-mode", this.onCameraMode);
